@@ -18,18 +18,6 @@
         /** Путь запроса создания нового хода разговора. */
         conversationPath: '/backend-api/f/conversation',
 
-        /** Базовый URL загрузки состояния существующего разговора. */
-        conversationStatePath: '/backend-api/conversations',
-
-        /** URL восстановления резервной копии Chat после перехода в Work. */
-        restoreChatBackupUrl: '/backend-api/tpp/work-handoff/restore-chat',
-
-        /** URL отмены Work handoff с restoration snapshot. */
-        undoWorkHandoffUrl: '/backend-api/tpp/work-handoff/undo',
-
-        /** Количество сообщений одной страницы при поиске результата Work handoff. */
-        conversationPageSize: 50,
-
         /** Значение выбора, при котором скрипт не меняет slug модели. */
         autoModelSlug: 'auto',
 
@@ -99,19 +87,16 @@
         applyButton: null,
         reloadButton: null,
         restoreButton: null,
-        restoreChatButton: null,
         hookStatus: null,
         catalogStatus: null,
         selectedStatus: null,
         requestStatus: null,
         backendStatus: null,
-        restoreChatStatus: null,
         hookTimer: null,
         dragState: null,
         collapsed: false,
         lastRequestedModelSlug: '',
         lastResolvedModelSlug: '',
-        restoringChat: false,
         stopped: false
     };
 
@@ -1014,305 +999,6 @@
     }
 
     /**
-     * Возвращает идентификатор разговора из URL текущей страницы.
-     *
-     * @returns {string}
-     */
-    function getCurrentConversationId() {
-        const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
-
-        return match ? decodeURIComponent(match[1]) : '';
-    }
-
-    /**
-     * Выполняет авторизованный JSON-запрос к внутреннему backend текущей сессии.
-     *
-     * Bearer-токен существует только в локальной переменной запроса и не
-     * записывается в DOM, console, состояние панели или localStorage.
-     *
-     * @param {string} url
-     * @param {RequestInit} [init]
-     * @returns {Promise<Record<string, any>>}
-     */
-    async function requestAuthenticatedJson(url, init = {}) {
-        const accessToken = await loadSessionAccessToken();
-        const headers = new Headers(init.headers || {});
-
-        headers.set('Accept', 'application/json');
-        headers.set('Authorization', `Bearer ${accessToken}`);
-
-        if (init.body !== undefined && !headers.has('Content-Type')) {
-            headers.set('Content-Type', 'application/json');
-        }
-
-        const response = await state.baseFetch.call(window, url, {
-            ...init,
-            credentials: 'include',
-            headers
-        });
-        const responseText = await response.text();
-        let payload = {};
-
-        if (responseText) {
-            try {
-                payload = JSON.parse(responseText);
-            } catch {
-                throw new Error(`${url}: backend вернул не JSON, HTTP ${response.status}`);
-            }
-        }
-
-        if (!response.ok) {
-            const backendMessage = payload?.detail?.message || payload?.message || payload?.detail || '';
-
-            throw new Error(
-                `${url}: HTTP ${response.status}${backendMessage ? `; ${String(backendMessage)}` : ''}`
-            );
-        }
-
-        return payload;
-    }
-
-    /**
-     * Возвращает JSON-строки из содержимого backend-сообщения.
-     *
-     * Результат Work handoff хранится в скрытом tool-сообщении continue_in_work.
-     * Поддерживаются текстовое content.text и строковые элементы content.parts,
-     * используемые текущими форматами conversation API.
-     *
-     * @param {Record<string, any>} message
-     * @returns {string[]}
-     */
-    function getMessageJsonTexts(message) {
-        const texts = [];
-        const content = message?.content;
-
-        if (typeof content?.text === 'string') {
-            texts.push(content.text);
-        }
-
-        if (Array.isArray(content?.parts)) {
-            for (const part of content.parts) {
-                if (typeof part === 'string') {
-                    texts.push(part);
-                }
-            }
-        }
-
-        return texts;
-    }
-
-    /**
-     * Возвращает подтверждённый результат перехода Chat → Work из скрытого
-     * backend-сообщения continue_in_work.
-     *
-     * @param {Record<string, any>} message
-     * @param {string} conversationId
-     * @returns {{ version: number, status: string, handoff_id: string, source_conversation_id: string, source_user_message_id: string, destination_conversation_id: string, destination_user_message_id: string, chat_backup_conversation_id?: string, restoration_snapshot?: Record<string, any> } | null}
-     */
-    function parseWorkHandoffResult(message, conversationId) {
-        if (
-            message?.author?.role !== 'tool'
-            || message.author?.name !== 'continue_in_work'
-            || message.status !== 'finished_successfully'
-            || message.metadata?.is_visually_hidden_from_conversation !== true
-        ) {
-            return null;
-        }
-
-        for (const jsonText of getMessageJsonTexts(message)) {
-            let result;
-
-            try {
-                result = JSON.parse(jsonText);
-            } catch {
-                continue;
-            }
-
-            if (
-                result?.version !== 1
-                || result.status !== 'accepted'
-                || typeof result.handoff_id !== 'string'
-                || typeof result.source_conversation_id !== 'string'
-                || typeof result.source_user_message_id !== 'string'
-                || typeof result.destination_conversation_id !== 'string'
-                || typeof result.destination_user_message_id !== 'string'
-                || result.source_conversation_id !== conversationId
-            ) {
-                continue;
-            }
-
-            const hasChatBackup = typeof result.chat_backup_conversation_id === 'string'
-                && result.chat_backup_conversation_id
-                && result.chat_backup_conversation_id !== conversationId;
-            const hasRestorationSnapshot = result.restoration_snapshot
-                && typeof result.restoration_snapshot === 'object'
-                && !Array.isArray(result.restoration_snapshot);
-
-            if (!hasChatBackup && !hasRestorationSnapshot) {
-                continue;
-            }
-
-            return result;
-        }
-
-        return null;
-    }
-
-    /**
-     * Ищет последний доступный для отмены Work handoff на текущей ветке разговора.
-     *
-     * Conversation API отдаёт последние сообщения и page_info. Если handoff не
-     * находится на текущей странице, метод последовательно запрашивает более
-     * ранние страницы через page_info.start_cursor до результата или начала чата.
-     *
-     * @param {string} conversationId
-     * @returns {Promise<{ result: Record<string, any>, conversation: Record<string, any> } | null>}
-     */
-    async function findRestorableWorkHandoff(conversationId) {
-        const query = new URLSearchParams({
-            include_has_versions: 'true',
-            num_turns: String(config.conversationPageSize)
-        });
-        let conversation = await requestAuthenticatedJson(
-            `${config.conversationStatePath}/${encodeURIComponent(conversationId)}?${query}`
-        );
-        let messages = Array.isArray(conversation.messages) ? conversation.messages : [];
-        let pageInfo = conversation.page_info || null;
-        const visitedCursors = new Set();
-
-        while (true) {
-            for (let index = messages.length - 1; index >= 0; index -= 1) {
-                const result = parseWorkHandoffResult(messages[index], conversationId);
-
-                if (result) {
-                    return { result, conversation };
-                }
-            }
-
-            if (!pageInfo?.has_previous_page || typeof pageInfo.start_cursor !== 'string' || !pageInfo.start_cursor) {
-                return null;
-            }
-
-            if (visitedCursors.has(pageInfo.start_cursor)) {
-                throw new Error('Conversation API повторил cursor при поиске Work handoff');
-            }
-
-            visitedCursors.add(pageInfo.start_cursor);
-
-            const pageQuery = new URLSearchParams({
-                before: pageInfo.start_cursor,
-                include_has_versions: 'true',
-                num_turns: String(config.conversationPageSize)
-            });
-            const page = await requestAuthenticatedJson(
-                `${config.conversationStatePath}/${encodeURIComponent(conversationId)}/messages?${pageQuery}`
-            );
-
-            messages = Array.isArray(page.messages) ? page.messages : [];
-            pageInfo = page.page_info || null;
-        }
-    }
-
-    /**
-     * Восстанавливает исходный Chat для разговора, ранее преобразованного в Work.
-     *
-     * Для handoff с chat_backup_conversation_id используется штатный
-     * /tpp/work-handoff/restore-chat и выполняется переход на возвращённый Chat.
-     * Для handoff с restoration_snapshot используется штатный
-     * /tpp/work-handoff/undo, после чего текущая страница перезагружается.
-     *
-     * Метод не снимает лимиты Work и не отправляет сообщение в обход frontend.
-     *
-     * @returns {Promise<void>}
-     */
-    async function restoreWorkConversationToChat() {
-        if (state.restoringChat) {
-            return;
-        }
-
-        const conversationId = getCurrentConversationId();
-
-        if (!conversationId) {
-            setStatus(state.restoreChatStatus, 'Chat: текущая страница не является разговором', 'error');
-            return;
-        }
-
-        state.restoringChat = true;
-
-        if (state.restoreChatButton) {
-            state.restoreChatButton.disabled = true;
-        }
-
-        setStatus(state.restoreChatStatus, 'Chat: поиск доступного Work handoff…', 'neutral');
-
-        try {
-            const handoff = await findRestorableWorkHandoff(conversationId);
-
-            if (!handoff) {
-                setStatus(state.restoreChatStatus, 'Chat: доступный для отмены Work handoff не найден', 'warning');
-                return;
-            }
-
-            const result = handoff.result;
-
-            if (typeof result.chat_backup_conversation_id === 'string' && result.chat_backup_conversation_id) {
-                setStatus(state.restoreChatStatus, 'Chat: восстановление резервной копии…', 'neutral');
-
-                const restored = await requestAuthenticatedJson(config.restoreChatBackupUrl, {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        source_conversation_id: conversationId,
-                        handoff_id: result.handoff_id
-                    })
-                });
-
-                if (restored.conversation_id !== result.chat_backup_conversation_id) {
-                    throw new Error('Backend вернул другой conversation_id резервной копии Chat');
-                }
-
-                setStatus(state.restoreChatStatus, `Chat: восстановлен ${restored.conversation_id}; переход…`, 'success');
-                window.location.assign(`/c/${encodeURIComponent(restored.conversation_id)}`);
-                return;
-            }
-
-            if (result.restoration_snapshot && typeof result.restoration_snapshot === 'object') {
-                setStatus(state.restoreChatStatus, 'Chat: отмена Work handoff…', 'neutral');
-
-                const restored = await requestAuthenticatedJson(config.undoWorkHandoffUrl, {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        handoff_id: result.handoff_id,
-                        source_conversation_id: conversationId
-                    })
-                });
-
-                if (restored.handoff_id !== result.handoff_id || restored.source_conversation_id !== conversationId) {
-                    throw new Error('Backend вернул несогласованный результат отмены Work handoff');
-                }
-
-                setStatus(
-                    state.restoreChatStatus,
-                    `Chat: восстановлен${restored.restored_model_slug ? `; модель ${restored.restored_model_slug}` : ''}; перезагрузка…`,
-                    'success'
-                );
-                window.location.reload();
-                return;
-            }
-
-            setStatus(state.restoreChatStatus, 'Chat: backend не предоставил способ восстановления', 'warning');
-        } catch (error) {
-            setStatus(state.restoreChatStatus, `Chat: ошибка восстановления: ${error.message}`, 'error');
-            log('restore Work conversation to Chat failed', error);
-        } finally {
-            state.restoringChat = false;
-
-            if (state.restoreChatButton) {
-                state.restoreChatButton.disabled = false;
-            }
-        }
-    }
-
-    /**
      * Загружает и возвращает JSON backend-метода.
      *
      * @param {string} url
@@ -1623,15 +1309,13 @@
         const applyButton = createElement('button', { class: 'gpt-model-picker-button', type: 'button' }, 'Применить сейчас');
         const reloadButton = createElement('button', { class: 'gpt-model-picker-button', type: 'button' }, 'Обновить каталоги');
         const restoreButton = createElement('button', { class: 'gpt-model-picker-button', type: 'button' }, 'Вернуть перехват');
-        const restoreChatButton = createElement('button', { class: 'gpt-model-picker-button gpt-model-picker-button-primary', type: 'button' }, 'Work → Chat');
         const diagnostics = createElement('div', { class: 'gpt-model-picker-diagnostics' });
         const hookStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' });
         const catalogStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Каталоги: инициализация…');
         const selectedStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Выбрано: инициализация…');
         const requestStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Запрос: ещё не отправлялся');
         const backendStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Backend: ещё не проверен');
-        const restoreChatStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Chat: восстановление ещё не запускалось');
-        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Оставаться в Chat предотвращает Work handoff нового хода. Work → Chat использует штатный backend восстановления уже преобразованного разговора. Лимиты Work не обходятся.');
+        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Выбор применяется сразу. Кнопки оставлены как ручной резерв. Оставаться в Chat задаёт primary_assistant и не передаёт Work origin. Auto не вмешивается в модель.');
 
         header.append(title, collapseButton);
         modelLabel.append(modelLabelText, select);
@@ -1639,8 +1323,8 @@
         thinkingLabel.append(thinkingLabelText, thinkingSelect);
         fastLabel.append(fastCheckbox, fastText);
         forceChatLabel.append(forceChatCheckbox, forceChatText);
-        buttons.append(applyButton, reloadButton, restoreButton, restoreChatButton);
-        diagnostics.append(hookStatus, catalogStatus, selectedStatus, requestStatus, backendStatus, restoreChatStatus);
+        buttons.append(applyButton, reloadButton, restoreButton);
+        diagnostics.append(hookStatus, catalogStatus, selectedStatus, requestStatus, backendStatus);
         panel.append(header, modelLabel, inputLabel, thinkingLabel, fastLabel, forceChatLabel, buttons, diagnostics, hint);
         document.body.append(panel);
 
@@ -1656,13 +1340,11 @@
             applyButton,
             reloadButton,
             restoreButton,
-            restoreChatButton,
             hookStatus,
             catalogStatus,
             selectedStatus,
             requestStatus,
-            backendStatus,
-            restoreChatStatus
+            backendStatus
         });
 
         select.addEventListener('change', () => {
@@ -1683,7 +1365,6 @@
             loadModels();
         });
         restoreButton.addEventListener('click', restoreHook);
-        restoreChatButton.addEventListener('click', restoreWorkConversationToChat);
         collapseButton.addEventListener('click', () => setPanelCollapsed(!state.collapsed, true));
         header.addEventListener('pointerdown', handleHeaderPointerDown);
         header.addEventListener('pointermove', handleHeaderPointerMove);
@@ -1751,14 +1432,12 @@
                 color: #f5f5f5; cursor: pointer; user-select: none;
             }
             .gpt-model-picker-checkbox { width: 16px; height: 16px; margin: 0; accent-color: auto; }
-            .gpt-model-picker-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+            .gpt-model-picker-buttons { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
             .gpt-model-picker-button {
                 min-height: 34px; padding: 6px 10px; box-sizing: border-box; color: #f5f5f5;
                 background: #343541; border: 1px solid #565869; border-radius: 7px; font: inherit; cursor: pointer;
             }
             .gpt-model-picker-button:hover { background: #444654; }
-            .gpt-model-picker-button-primary { font-weight: 700; border-color: #7c8cff; }
-            .gpt-model-picker-button:disabled { opacity: 0.55; cursor: wait; }
             .gpt-model-picker-diagnostics { display: grid; gap: 3px; padding: 8px; background: #17181a; border-radius: 7px; }
             .gpt-model-picker-status { color: #d4d4d8; word-break: break-word; }
             .gpt-model-picker-status[data-status-type='success'] { color: #86efac; }
@@ -1821,7 +1500,6 @@
         setSelectedThinkingEffort,
         setFastModeEnabled,
         setForceChatEnabled,
-        restoreWorkConversationToChat,
         restoreHook
     };
 
