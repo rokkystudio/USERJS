@@ -1,4 +1,4 @@
-// GPT_MODEL_PICKER.js
+// GPT_MODEL_PICKER.js v1.0.5
 (() => {
     'use strict';
 
@@ -9,6 +9,9 @@
     }
 
     const config = {
+        /** Версия файла и панели. */
+        version: '1.0.5',
+
         /** URL backend-метода со списком моделей режима Work. */
         workModelsUrl: '/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true',
 
@@ -21,6 +24,9 @@
         /** Базовый URL загрузки состояния существующего разговора. */
         conversationStatePath: '/backend-api/conversations',
 
+        /** URL списка разговоров, содержащего серверный conversation_origin для sidebar. */
+        conversationListPath: '/backend-api/conversations',
+
         /** URL восстановления резервной копии Chat после перехода в Work. */
         restoreChatBackupUrl: '/backend-api/tpp/work-handoff/restore-chat',
 
@@ -29,6 +35,27 @@
 
         /** Количество сообщений одной страницы при поиске результата Work handoff. */
         conversationPageSize: 50,
+
+        /** Количество разговоров одной страницы штатного sidebar-запроса ChatGPT. */
+        conversationListPageSize: 28,
+
+        /** Текущий ключ режима поверхности Chat / Work в localStorage ChatGPT. */
+        chatSurfaceModeStorageKey: 'oai/apps/tpp/chat-surface-mode',
+
+        /** Текущий cookie режима поверхности Chat / Work в ChatGPT. */
+        chatSurfaceModeCookieKey: 'oai-chat-surface-mode',
+
+        /** Срок штатного ChatSurfaceMode cookie: два года в секундах. */
+        chatSurfaceModeCookieMaxAgeSeconds: 2 * 365 * 24 * 60 * 60,
+
+        /** Ключ текущего разговора с локальным прямым переключением Work → Chat. */
+        directWorkChatSessionKey: 'gpt-model-picker.direct-work-chat.v1',
+
+        /** Значение штатной поверхности обычного Chat. */
+        chatSurfaceMode: 'chatgpt',
+
+        /** Значение штатной поверхности Work. */
+        workSurfaceMode: 'work',
 
         /** Значение выбора, при котором скрипт не меняет slug модели. */
         autoModelSlug: 'auto',
@@ -112,6 +139,7 @@
         lastRequestedModelSlug: '',
         lastResolvedModelSlug: '',
         restoringChat: false,
+        directWorkChatConversationId: '',
         stopped: false
     };
 
@@ -196,8 +224,10 @@
      * Выбор модели Auto сохраняет исходный slug. Значение thinking effort Auto
      * сохраняет штатный thinking_effort. Включённая скорость задаёт
      * service_tier=priority, выключенная сохраняет штатный tier. Для обычного
-     * primary_assistant режим «Оставаться в Chat» задаёт primary_assistant и
-     * исключает Work-origin из исходящего хода. Gizmo-режимы не преобразуются.
+     * primary_assistant режим «Оставаться в Chat» задаёт primary_assistant,
+     * исключает Work-origin и execution target из исходящего хода. Метаданные
+     * нового user-сообщения также не передают conversation_execution_target.
+     * Gizmo-режимы не преобразуются.
      *
      * @param {string} body
      * @returns {{ body: string, changed: boolean, originalModelSlug: string, requestedModelSlug: string, originalThinkingEffort: string, requestedThinkingEffort: string, originalServiceTier: string, requestedServiceTier: string, originalConversationOrigin: string, originalConversationMode: string, requestedConversationMode: string } | null}
@@ -288,6 +318,24 @@
             if (Object.prototype.hasOwnProperty.call(payload, 'tpp_work_handoff_conversion')) {
                 delete payload.tpp_work_handoff_conversion;
                 changed = true;
+            }
+
+            if (Object.prototype.hasOwnProperty.call(payload, 'conversation_execution_target')) {
+                delete payload.conversation_execution_target;
+                changed = true;
+            }
+
+            if (Array.isArray(payload.messages)) {
+                for (const message of payload.messages) {
+                    if (
+                        message?.author?.role === 'user'
+                        && message.metadata
+                        && Object.prototype.hasOwnProperty.call(message.metadata, 'conversation_execution_target')
+                    ) {
+                        delete message.metadata.conversation_execution_target;
+                        changed = true;
+                    }
+                }
             }
         }
 
@@ -1073,6 +1121,52 @@
     }
 
     /**
+     * Возвращает серверную карточку текущего разговора из списка sidebar.
+     *
+     * Полный conversation endpoint может возвращать conversation_origin=null для
+     * разговора, который список /backend-api/conversations продолжает помечать как
+     * conversation_origin=tpp. Метод постранично просматривает официальный список
+     * разговоров до найденного id или достижения объявленного backend total.
+     *
+     * @param {string} conversationId
+     * @returns {Promise<Record<string, any> | null>}
+     */
+    async function findConversationSummary(conversationId) {
+        let offset = 0;
+
+        while (true) {
+            const query = new URLSearchParams({
+                offset: String(offset),
+                limit: String(config.conversationListPageSize),
+                order: 'updated',
+                is_archived: 'false',
+                is_starred: 'false'
+            });
+            const page = await requestAuthenticatedJson(
+                `${config.conversationListPath}?${query}`
+            );
+            const items = Array.isArray(page.items) ? page.items : [];
+            const summary = items.find((item) => item?.id === conversationId);
+
+            if (summary) {
+                return summary;
+            }
+
+            const total = Number(page.total);
+
+            offset += items.length;
+
+            if (
+                items.length === 0
+                || !Number.isFinite(total)
+                || offset >= total
+            ) {
+                return null;
+            }
+        }
+    }
+
+    /**
      * Возвращает JSON-строки из содержимого backend-сообщения.
      *
      * Результат Work handoff хранится в скрытом tool-сообщении continue_in_work.
@@ -1159,21 +1253,22 @@
     }
 
     /**
-     * Ищет последний доступный для отмены Work handoff на текущей ветке разговора.
+     * Ищет последний доступный для отмены Work handoff и возвращает состояние
+     * текущего разговора независимо от наличия handoff.
      *
      * Conversation API отдаёт последние сообщения и page_info. Если handoff не
      * находится на текущей странице, метод последовательно запрашивает более
      * ранние страницы через page_info.start_cursor до результата или начала чата.
      *
      * @param {string} conversationId
-     * @returns {Promise<{ result: Record<string, any>, conversation: Record<string, any> } | null>}
+     * @returns {Promise<{ result: Record<string, any> | null, conversation: Record<string, any> }>}
      */
-    async function findRestorableWorkHandoff(conversationId) {
+    async function inspectRestorableWorkHandoff(conversationId) {
         const query = new URLSearchParams({
             include_has_versions: 'true',
             num_turns: String(config.conversationPageSize)
         });
-        let conversation = await requestAuthenticatedJson(
+        const conversation = await requestAuthenticatedJson(
             `${config.conversationStatePath}/${encodeURIComponent(conversationId)}?${query}`
         );
         let messages = Array.isArray(conversation.messages) ? conversation.messages : [];
@@ -1190,7 +1285,7 @@
             }
 
             if (!pageInfo?.has_previous_page || typeof pageInfo.start_cursor !== 'string' || !pageInfo.start_cursor) {
-                return null;
+                return { result: null, conversation };
             }
 
             if (visitedCursors.has(pageInfo.start_cursor)) {
@@ -1214,14 +1309,163 @@
     }
 
     /**
-     * Восстанавливает исходный Chat для разговора, ранее преобразованного в Work.
+     * Записывает текущий штатный Chat surface mode ChatGPT как обычный Chat.
      *
-     * Для handoff с chat_backup_conversation_id используется штатный
-     * /tpp/work-handoff/restore-chat и выполняется переход на возвращённый Chat.
-     * Для handoff с restoration_snapshot используется штатный
-     * /tpp/work-handoff/undo, после чего текущая страница перезагружается.
+     * Frontend 2026-09 использует localStorage oai/apps/tpp/chat-surface-mode со
+     * значениями "chatgpt"/"work" и cookie oai-chat-surface-mode с raw-значением
+     * chatgpt/work. Метод синхронизирует оба источника, которые читает frontend.
      *
-     * Метод не снимает лимиты Work и не отправляет сообщение в обход frontend.
+     * @returns {{ previousStorageValue: string | null, nextStorageValue: string, previousCookieValue: string | null, nextCookieValue: string, changed: boolean }}
+     */
+    function setNativeChatSurfaceMode() {
+        const previousStorageValue = localStorage.getItem(config.chatSurfaceModeStorageKey);
+        const nextStorageValue = JSON.stringify(config.chatSurfaceMode);
+        const cookiePrefix = `${config.chatSurfaceModeCookieKey}=`;
+        const previousCookieEntry = document.cookie
+            .split('; ')
+            .find((entry) => entry.startsWith(cookiePrefix));
+        const previousCookieValue = previousCookieEntry
+            ? decodeURIComponent(previousCookieEntry.slice(cookiePrefix.length))
+            : null;
+        const nextCookieValue = config.chatSurfaceMode;
+
+        localStorage.setItem(config.chatSurfaceModeStorageKey, nextStorageValue);
+        document.cookie = `${config.chatSurfaceModeCookieKey}=${encodeURIComponent(nextCookieValue)}; path=/; max-age=${config.chatSurfaceModeCookieMaxAgeSeconds}; SameSite=Lax`;
+
+        return {
+            previousStorageValue,
+            nextStorageValue,
+            previousCookieValue,
+            nextCookieValue,
+            changed: previousStorageValue !== nextStorageValue || previousCookieValue !== nextCookieValue
+        };
+    }
+
+    /**
+     * Запоминает текущий прямой Work-разговор как локально переключённый в Chat.
+     *
+     * Маркер хранится только в sessionStorage вкладки и используется для
+     * разблокировки штатной кнопки Send после перезагрузки. Исходящий payload
+     * при этом проходит через обычный перехват и получает Chat-параметры.
+     *
+     * @param {string} conversationId
+     */
+    function setDirectWorkChatConversation(conversationId) {
+        state.directWorkChatConversationId = conversationId;
+        sessionStorage.setItem(config.directWorkChatSessionKey, conversationId);
+    }
+
+    /**
+     * Восстанавливает вкладочный маркер прямого Work → Chat для текущего URL.
+     *
+     * Маркер другого разговора удаляется, чтобы разблокировка Send не
+     * распространялась на соседние вкладки или последующую навигацию.
+     */
+    function restoreDirectWorkChatConversation() {
+        const conversationId = getCurrentConversationId();
+        const storedConversationId = sessionStorage.getItem(config.directWorkChatSessionKey) || '';
+
+        if (storedConversationId && storedConversationId === conversationId) {
+            state.directWorkChatConversationId = storedConversationId;
+            return;
+        }
+
+        state.directWorkChatConversationId = '';
+
+        if (storedConversationId) {
+            sessionStorage.removeItem(config.directWorkChatSessionKey);
+        }
+    }
+
+    /**
+     * Возвращает текст текущего composer без изменения редактора.
+     *
+     * @returns {string}
+     */
+    function getComposerPromptText() {
+        const editor = document.querySelector('#prompt-textarea');
+
+        if (!editor) {
+            return '';
+        }
+
+        if (typeof editor.value === 'string') {
+            return editor.value.trim();
+        }
+
+        return String(editor.textContent || '').trim();
+    }
+
+    /**
+     * Поддерживает штатную кнопку отправки активной для прямого Work-разговора,
+     * локально переключённого в Chat этой вкладкой.
+     *
+     * Метод работает только для сохранённого conversation id, включённого режима
+     * «Оставаться в Chat», непустого composer и штатной кнопки Send. Кнопка Stop
+     * во время генерации не затрагивается.
+     */
+    function maintainDirectWorkChatSubmitButton() {
+        if (
+            !state.forceChatEnabled
+            || !state.directWorkChatConversationId
+            || state.directWorkChatConversationId !== getCurrentConversationId()
+            || !getComposerPromptText()
+        ) {
+            return;
+        }
+
+        const submitButton = document.querySelector(
+            '#composer-submit-button[data-testid="send-button"]'
+        );
+
+        if (!(submitButton instanceof HTMLButtonElement)) {
+            return;
+        }
+
+        if (submitButton.disabled) {
+            submitButton.disabled = false;
+        }
+
+        if (submitButton.getAttribute('aria-disabled') === 'true') {
+            submitButton.setAttribute('aria-disabled', 'false');
+        }
+    }
+
+    /**
+     * Переключает поверхность прямого Work-разговора на штатный Chat surface и
+     * готовит следующий исходящий ход к отправке через Chat-параметры.
+     *
+     * Прямой Work не содержит continue_in_work handoff, поэтому restore-chat и
+     * undo к нему неприменимы. Для такого разговора localStorage и cookie
+     * ChatSurfaceMode получают chatgpt, создаётся вкладочный маркер Chat и
+     * выполняется перезагрузка страницы, чтобы frontend перечитал режим и лимиты.
+     *
+     * @param {string} conversationId
+     */
+    function switchDirectWorkConversationToChat(conversationId) {
+        const modeChange = setNativeChatSurfaceMode();
+        const previousSurface = modeChange.previousCookieValue
+            ?? modeChange.previousStorageValue
+            ?? 'не задан';
+
+        setDirectWorkChatConversation(conversationId);
+        setStatus(
+            state.restoreChatStatus,
+            `Chat: прямой Work → Chat; surface ${previousSurface} → ${modeChange.nextCookieValue}; перезагрузка…`,
+            'success'
+        );
+        window.location.reload();
+    }
+
+    /**
+     * Переключает текущий Work-разговор в Chat доступным для него способом.
+     *
+     * Handoff-разговор восстанавливается через штатные restore-chat или undo.
+     * Для разговора без handoff server-side conversation_origin проверяется и в
+     * полном conversation endpoint, и в списке sidebar /backend-api/conversations.
+     * Прямой Work с conversation_origin=tpp переводит Chat surface в chatgpt,
+     * сохраняет вкладочный Chat override и перезагружает frontend. Следующий ход
+     * очищается от Work execution target.
      *
      * @returns {Promise<void>}
      */
@@ -1246,14 +1490,34 @@
         setStatus(state.restoreChatStatus, 'Chat: поиск доступного Work handoff…', 'neutral');
 
         try {
-            const handoff = await findRestorableWorkHandoff(conversationId);
+            const handoff = await inspectRestorableWorkHandoff(conversationId);
+            const result = handoff.result;
 
-            if (!handoff) {
-                setStatus(state.restoreChatStatus, 'Chat: доступный для отмены Work handoff не найден', 'warning');
+            if (!result) {
+                const conversationSummary = handoff.conversation?.conversation_origin === 'tpp'
+                    ? null
+                    : await findConversationSummary(conversationId);
+                const conversationOrigin = handoff.conversation?.conversation_origin
+                    || conversationSummary?.conversation_origin
+                    || '';
+
+                if (conversationOrigin === 'tpp') {
+                    setStatus(
+                        state.restoreChatStatus,
+                        `Chat: прямой Work без handoff; server origin tpp${conversationSummary ? ' найден в списке разговоров' : ''}; переключение surface…`,
+                        'neutral'
+                    );
+                    switchDirectWorkConversationToChat(conversationId);
+                    return;
+                }
+
+                setStatus(
+                    state.restoreChatStatus,
+                    `Chat: handoff отсутствует; server origin ${conversationOrigin || 'null'}`,
+                    'warning'
+                );
                 return;
             }
-
-            const result = handoff.result;
 
             if (typeof result.chat_backup_conversation_id === 'string' && result.chat_backup_conversation_id) {
                 setStatus(state.restoreChatStatus, 'Chat: восстановление резервной копии…', 'neutral');
@@ -1420,6 +1684,7 @@
         }
 
         updateHookStatus();
+        maintainDirectWorkChatSubmitButton();
     }
 
     /**
@@ -1578,7 +1843,7 @@
             'aria-label': 'Выбор и контроль модели ChatGPT'
         });
         const header = createElement('div', { class: 'gpt-model-picker-header' });
-        const title = createElement('div', { class: 'gpt-model-picker-title' }, 'Модель ChatGPT');
+        const title = createElement('div', { class: 'gpt-model-picker-title' }, `Модель ChatGPT v${config.version}`);
         const collapseButton = createElement('button', {
             class: 'gpt-model-picker-collapse',
             type: 'button',
@@ -1631,7 +1896,7 @@
         const requestStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Запрос: ещё не отправлялся');
         const backendStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Backend: ещё не проверен');
         const restoreChatStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Chat: восстановление ещё не запускалось');
-        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Оставаться в Chat предотвращает Work handoff нового хода. Work → Chat использует штатный backend восстановления уже преобразованного разговора. Лимиты Work не обходятся.');
+        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Оставаться в Chat очищает Work-параметры нового хода. Work → Chat восстанавливает handoff либо переводит прямой Work composer в Chat. Для прямого Work Send разблокируется только в этой вкладке и запрос отправляется с Chat-параметрами.');
 
         header.append(title, collapseButton);
         modelLabel.append(modelLabelText, select);
@@ -1694,9 +1959,16 @@
         state.selectedThinkingEffort = localStorage.getItem(config.thinkingEffortStorageKey) || 'auto';
         state.fastModeEnabled = localStorage.getItem(config.fastModeStorageKey) === 'true';
         state.forceChatEnabled = localStorage.getItem(config.forceChatStorageKey) !== 'false';
+        restoreDirectWorkChatConversation();
         setSelectedThinkingEffort(state.selectedThinkingEffort, false);
         setFastModeEnabled(state.fastModeEnabled, false);
         setForceChatEnabled(state.forceChatEnabled, false);
+
+        if (state.directWorkChatConversationId) {
+            setStatus(state.restoreChatStatus, 'Chat: прямой Work локально переключён в Chat; Send доступен для Chat-запроса', 'success');
+            maintainDirectWorkChatSubmitButton();
+        }
+
         setPanelCollapsed(localStorage.getItem(config.collapsedStorageKey) === 'true', false);
         restorePanelPosition();
     }
@@ -1821,6 +2093,11 @@
         setSelectedThinkingEffort,
         setFastModeEnabled,
         setForceChatEnabled,
+        updateConversationBody,
+        inspectRestorableWorkHandoff,
+        findConversationSummary,
+        setNativeChatSurfaceMode,
+        maintainDirectWorkChatSubmitButton,
         restoreWorkConversationToChat,
         restoreHook
     };

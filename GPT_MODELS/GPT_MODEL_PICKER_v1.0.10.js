@@ -1,4 +1,4 @@
-// GPT_MODEL_PICKER.js
+// GPT_MODEL_PICKER.js v1.0.10
 (() => {
     'use strict';
 
@@ -9,6 +9,9 @@
     }
 
     const config = {
+        /** Версия файла и панели. */
+        version: '1.0.10',
+
         /** URL backend-метода со списком моделей режима Work. */
         workModelsUrl: '/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true',
 
@@ -30,7 +33,7 @@
         /** Ключ режима ускоренной обработки в localStorage. */
         fastModeStorageKey: 'gpt-model-picker.fast-mode.v1',
 
-        /** Ключ принудительного сохранения обычного режима Chat в localStorage. */
+        /** Ключ переключателя Chat Mode в localStorage. */
         forceChatStorageKey: 'gpt-model-picker.force-chat.v1',
 
         /** Ключ позиции панели в localStorage. */
@@ -38,6 +41,9 @@
 
         /** Ключ состояния свёрнутой панели в localStorage. */
         collapsedStorageKey: 'gpt-model-picker.collapsed.v1',
+
+        /** Ключ пользовательского размера панели в localStorage. */
+        sizeStorageKey: 'gpt-model-picker.size.v1',
 
         /** Период проверки и автоматического восстановления перехватчика window.fetch. */
         hookCheckIntervalMs: 1000,
@@ -84,15 +90,13 @@
         thinkingSelect: null,
         fastCheckbox: null,
         forceChatCheckbox: null,
-        applyButton: null,
-        reloadButton: null,
-        restoreButton: null,
         hookStatus: null,
         catalogStatus: null,
         selectedStatus: null,
         requestStatus: null,
         backendStatus: null,
         hookTimer: null,
+        resizeObserver: null,
         dragState: null,
         collapsed: false,
         lastRequestedModelSlug: '',
@@ -178,11 +182,14 @@
     /**
      * Изменяет модель, глубину рассуждения, скорость и режим разговора в JSON payload.
      *
-     * Выбор модели Auto сохраняет исходный slug. Значение thinking effort Auto
+     * Режим «Не изменять модель» сохраняет исходный model slug. Значение thinking effort Auto
      * сохраняет штатный thinking_effort. Включённая скорость задаёт
-     * service_tier=priority, выключенная сохраняет штатный tier. Для обычного
-     * primary_assistant режим «Оставаться в Chat» задаёт primary_assistant и
-     * исключает Work-origin из исходящего хода. Gizmo-режимы не преобразуются.
+     * service_tier=priority, выключенная сохраняет штатный tier. При включённом
+     * Chat Mode и ручном выборе модели обычный primary_assistant ход остаётся
+     * Chat: задаётся primary_assistant, явно передаётся conversation_origin=null
+     * и исключается Work execution target. Метаданные нового user-сообщения
+     * также не передают conversation_execution_target. Выключенный Chat Mode
+     * оставляет режим разговора штатным. Gizmo-режимы не преобразуются.
      *
      * @param {string} body
      * @returns {{ body: string, changed: boolean, originalModelSlug: string, requestedModelSlug: string, originalThinkingEffort: string, requestedThinkingEffort: string, originalServiceTier: string, requestedServiceTier: string, originalConversationOrigin: string, originalConversationMode: string, requestedConversationMode: string } | null}
@@ -260,8 +267,8 @@
                 changed = true;
             }
 
-            if (Object.prototype.hasOwnProperty.call(payload, 'conversation_origin')) {
-                delete payload.conversation_origin;
+            if (!Object.prototype.hasOwnProperty.call(payload, 'conversation_origin') || payload.conversation_origin !== null) {
+                payload.conversation_origin = null;
                 changed = true;
             }
 
@@ -273,6 +280,24 @@
             if (Object.prototype.hasOwnProperty.call(payload, 'tpp_work_handoff_conversion')) {
                 delete payload.tpp_work_handoff_conversion;
                 changed = true;
+            }
+
+            if (Object.prototype.hasOwnProperty.call(payload, 'conversation_execution_target')) {
+                delete payload.conversation_execution_target;
+                changed = true;
+            }
+
+            if (Array.isArray(payload.messages)) {
+                for (const message of payload.messages) {
+                    if (
+                        message?.author?.role === 'user'
+                        && message.metadata
+                        && Object.prototype.hasOwnProperty.call(message.metadata, 'conversation_execution_target')
+                    ) {
+                        delete message.metadata.conversation_execution_target;
+                        changed = true;
+                    }
+                }
             }
         }
 
@@ -420,7 +445,7 @@
     /**
      * Отображает параметры, раскрытые backend-событиями ответа.
      *
-     * @param {{ requestedModelSlug: string, requestedThinkingEffort: string, requestedServiceTier: string }} requestInfo
+     * @param {{ requestedModelSlug: string, requestedThinkingEffort: string, requestedServiceTier: string, verifyDirectWorkChat?: boolean }} requestInfo
      * @param {{ modelSlug: string, thinkingEffort: string, serviceTier: string }} responseInfo
      */
     function displayBackendInfo(requestInfo, responseInfo) {
@@ -464,7 +489,7 @@
      */
     async function observeConversationResponse(response, requestInfo) {
         if (!response.ok) {
-            updateBackendStatus(`Backend: HTTP ${response.status}; модель ${requestInfo.requestedModelSlug || 'Auto'}`, 'error');
+            updateBackendStatus(`Backend: HTTP ${response.status}; модель ${requestInfo.requestedModelSlug || 'штатная'}`, 'error');
             return;
         }
 
@@ -537,12 +562,12 @@
     /**
      * Формирует строку параметров, применённых к исходящему запросу.
      *
-     * @param {{ originalModelSlug: string, requestedModelSlug: string, requestedThinkingEffort: string, requestedServiceTier: string }} requestInfo
+     * @param {{ originalModelSlug: string, requestedModelSlug: string, requestedThinkingEffort: string, requestedServiceTier: string, originalConversationOrigin: string, originalConversationMode: string, requestedConversationMode: string }} requestInfo
      * @returns {string}
      */
     function formatRequestStatus(requestInfo) {
         const modelText = state.selectedModelSlug === config.autoModelSlug
-            ? `Auto (${requestInfo.originalModelSlug || 'штатный slug'})`
+            ? `Не изменять модель (${requestInfo.originalModelSlug || 'штатный slug'})`
             : requestInfo.originalModelSlug && requestInfo.originalModelSlug !== requestInfo.requestedModelSlug
                 ? `${requestInfo.originalModelSlug} → ${requestInfo.requestedModelSlug}`
                 : requestInfo.requestedModelSlug;
@@ -552,8 +577,8 @@
         const speedText = state.fastModeEnabled
             ? 'скорость 1.5x (priority)'
             : `скорость штатная${requestInfo.requestedServiceTier ? ` (${requestInfo.requestedServiceTier})` : ''}`;
-        const modeText = state.forceChatEnabled && state.selectedModelSlug !== config.autoModelSlug
-            ? `режим Chat${requestInfo.originalConversationOrigin ? `; origin ${requestInfo.originalConversationOrigin} → Chat` : ''}`
+        const modeText = requestInfo.requestedConversationMode === 'chat'
+            ? `режим Chat Mode${requestInfo.originalConversationOrigin ? `; origin ${requestInfo.originalConversationOrigin} → Chat` : ''}`
             : `режим штатный${requestInfo.originalConversationMode ? ` (${requestInfo.originalConversationMode})` : ''}`;
 
         return `Запрос: ${modelText}; ${thinkingText}; ${speedText}; ${modeText}`;
@@ -709,14 +734,14 @@
     /** Обновляет строку выбранных параметров панели. */
     function updateSelectedStatus() {
         const modelText = state.selectedModelSlug === config.autoModelSlug
-            ? 'Auto (slug без вмешательства)'
+            ? 'Не изменять модель'
             : state.selectedModelSlug;
         const thinkingText = state.selectedThinkingEffort === 'auto'
             ? 'Auto'
             : state.selectedThinkingEffort;
         const speedText = state.fastModeEnabled ? '1.5x / priority' : 'штатная';
-        const modeText = state.forceChatEnabled && state.selectedModelSlug !== config.autoModelSlug
-            ? 'Chat принудительно'
+        const modeText = state.forceChatEnabled
+            ? state.selectedModelSlug === config.autoModelSlug ? 'Chat Mode / без замены модели' : 'Chat Mode'
             : 'штатный';
 
         setStatus(
@@ -729,7 +754,7 @@
     /**
      * Устанавливает модель и сохраняет её идентификатор.
      *
-     * Значение auto отключает замену slug в исходящих запросах.
+     * Внутреннее значение auto соответствует пункту «Не изменять модель» и отключает замену model slug.
      *
      * @param {string} modelSlug
      * @param {boolean} persist
@@ -802,11 +827,12 @@
         updateSelectedStatus();
     }
 
+
     /**
-     * Включает или выключает принудительную отправку обычного режима Chat.
+     * Устанавливает режим Chat Mode и сохраняет состояние.
      *
-     * При включении исходящий ход использует conversation_mode=primary_assistant,
-     * не передаёт conversation_origin Work и сохраняет выбранный model slug.
+     * Для ручного model slug включённый режим применяет Chat-параметры,
+     * а выключенный оставляет параметры режима исходного запроса.
      *
      * @param {boolean} enabled
      * @param {boolean} persist
@@ -941,14 +967,14 @@
         state.thinkingSelect.value = state.selectedThinkingEffort;
     }
 
-    /** Заполняет список Auto, Work-моделями, обычными моделями и ручным slug. */
+    /** Заполняет список режимом «Не изменять модель», Work-моделями, обычными моделями и ручным slug. */
     function renderModels() {
         if (!state.select) {
             return;
         }
 
         state.select.replaceChildren();
-        state.select.append(createElement('option', { value: config.autoModelSlug }, 'Auto — не менять slug'));
+        state.select.append(createElement('option', { value: config.autoModelSlug }, 'Не изменять модель'));
         appendModelGroup(state.select, 'Модели Work / TPP', state.workModels);
         appendModelGroup(state.select, 'Обычный ChatGPT', state.chatModels);
 
@@ -1170,6 +1196,56 @@
         }
     }
 
+    /** Сохраняет пользовательский размер развёрнутой панели. */
+    function savePanelSize() {
+        if (!state.panel || state.collapsed) {
+            return;
+        }
+
+        const rect = state.panel.getBoundingClientRect();
+
+        localStorage.setItem(config.sizeStorageKey, JSON.stringify({
+            width: rect.width,
+            height: rect.height
+        }));
+    }
+
+    /** Восстанавливает сохранённый размер панели с учётом текущего viewport. */
+    function restorePanelSize() {
+        const storedSize = localStorage.getItem(config.sizeStorageKey);
+
+        if (!storedSize) {
+            return;
+        }
+
+        try {
+            const size = JSON.parse(storedSize);
+
+            if (Number.isFinite(size?.width) && Number.isFinite(size?.height)) {
+                const maxWidth = Math.max(260, window.innerWidth - 16);
+                const maxHeight = Math.max(220, window.innerHeight - 16);
+                const width = Math.min(Math.max(260, size.width), maxWidth);
+                const height = Math.min(Math.max(220, size.height), maxHeight);
+
+                state.panel.style.width = `${width}px`;
+                state.panel.style.height = `${height}px`;
+            }
+        } catch (error) {
+            log('stored panel size is invalid', error);
+        }
+    }
+
+    /** Сохраняет размер после ручного изменения панели и удерживает её в viewport. */
+    function handlePanelResize() {
+        if (!state.panel || state.collapsed) {
+            return;
+        }
+
+        const rect = state.panel.getBoundingClientRect();
+        setPanelPosition(rect.left, rect.top);
+        savePanelSize();
+    }
+
     /**
      * Сворачивает или разворачивает панель и сохраняет состояние.
      *
@@ -1256,7 +1332,13 @@
         renderModels();
     }
 
-    /** Добавляет панель выбора модели, thinking effort, скорости и диагностики на страницу. */
+    /**
+     * Добавляет компактную изменяемую по размеру панель управления и диагностики.
+     *
+     * Шапка содержит иконку, название и версию и служит областью перемещения.
+     * Модель, thinking effort, скорость и Chat Mode применяются сразу при изменении.
+     * Размер и положение панели сохраняются между перезагрузками страницы.
+     */
     function createPanel() {
         const panel = createElement('section', {
             id: 'gpt-model-picker-panel',
@@ -1264,13 +1346,18 @@
             'aria-label': 'Выбор и контроль модели ChatGPT'
         });
         const header = createElement('div', { class: 'gpt-model-picker-header' });
-        const title = createElement('div', { class: 'gpt-model-picker-title' }, 'Модель ChatGPT');
+        const identity = createElement('div', { class: 'gpt-model-picker-identity' });
+        const icon = createElement('div', { class: 'gpt-model-picker-app-icon', 'aria-hidden': 'true' });
+        const titleCopy = createElement('div', { class: 'gpt-model-picker-title-copy' });
+        const title = createElement('div', { class: 'gpt-model-picker-title' }, 'GPT Model Picker');
+        const version = createElement('div', { class: 'gpt-model-picker-version' }, `ChatGPT · v${config.version}`);
         const collapseButton = createElement('button', {
             class: 'gpt-model-picker-collapse',
             type: 'button',
             'aria-label': 'Свернуть панель',
             'aria-expanded': 'true'
         }, '−');
+        const content = createElement('div', { class: 'gpt-model-picker-content' });
         const modelLabel = createElement('label', { class: 'gpt-model-picker-field' });
         const modelLabelText = createElement('span', { class: 'gpt-model-picker-field-label' }, 'Модель');
         const select = createElement('select', {
@@ -1291,41 +1378,42 @@
             class: 'gpt-model-picker-select',
             'aria-label': 'Глубина рассуждения'
         });
-        const fastLabel = createElement('label', { class: 'gpt-model-picker-fast' });
+        const toggles = createElement('div', { class: 'gpt-model-picker-toggles' });
+        const fastLabel = createElement('label', { class: 'gpt-model-picker-toggle' });
         const fastCheckbox = createElement('input', {
             class: 'gpt-model-picker-checkbox',
             type: 'checkbox',
             'aria-label': 'Скорость 1.5x'
         });
         const fastText = createElement('span', {}, 'Скорость 1.5x');
-        const forceChatLabel = createElement('label', { class: 'gpt-model-picker-fast' });
+        const forceChatLabel = createElement('label', { class: 'gpt-model-picker-toggle' });
         const forceChatCheckbox = createElement('input', {
             class: 'gpt-model-picker-checkbox',
             type: 'checkbox',
-            'aria-label': 'Оставаться в режиме Chat'
+            'aria-label': 'Chat Mode'
         });
-        const forceChatText = createElement('span', {}, 'Оставаться в Chat');
-        const buttons = createElement('div', { class: 'gpt-model-picker-buttons' });
-        const applyButton = createElement('button', { class: 'gpt-model-picker-button', type: 'button' }, 'Применить сейчас');
-        const reloadButton = createElement('button', { class: 'gpt-model-picker-button', type: 'button' }, 'Обновить каталоги');
-        const restoreButton = createElement('button', { class: 'gpt-model-picker-button', type: 'button' }, 'Вернуть перехват');
+        const forceChatText = createElement('span', {}, 'Chat Mode');
         const diagnostics = createElement('div', { class: 'gpt-model-picker-diagnostics' });
         const hookStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' });
         const catalogStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Каталоги: инициализация…');
         const selectedStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Выбрано: инициализация…');
         const requestStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Запрос: ещё не отправлялся');
         const backendStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Backend: ещё не проверен');
-        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Выбор применяется сразу. Кнопки оставлены как ручной резерв. Оставаться в Chat задаёт primary_assistant и не передаёт Work origin. Auto не вмешивается в модель.');
+        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Chat Mode удерживает ручной model slug в обычном primary_assistant Chat. Выключите его, если нужен штатный режим выбранной модели.');
 
-        header.append(title, collapseButton);
+        icon.innerHTML = '<svg viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="8" fill="#69afed"/><path d="M9 11.5h14M9 16h9M9 20.5h12" fill="none" stroke="#0f1720" stroke-width="2.2" stroke-linecap="round"/><circle cx="23" cy="20.5" r="2.2" fill="#f2f5f8"/></svg>';
+        titleCopy.append(title, version);
+        identity.append(icon, titleCopy);
+        header.append(identity, collapseButton);
         modelLabel.append(modelLabelText, select);
         inputLabel.append(inputLabelText, input);
         thinkingLabel.append(thinkingLabelText, thinkingSelect);
         fastLabel.append(fastCheckbox, fastText);
         forceChatLabel.append(forceChatCheckbox, forceChatText);
-        buttons.append(applyButton, reloadButton, restoreButton);
+        toggles.append(fastLabel, forceChatLabel);
         diagnostics.append(hookStatus, catalogStatus, selectedStatus, requestStatus, backendStatus);
-        panel.append(header, modelLabel, inputLabel, thinkingLabel, fastLabel, forceChatLabel, buttons, diagnostics, hint);
+        content.append(modelLabel, inputLabel, thinkingLabel, toggles, diagnostics, hint);
+        panel.append(header, content);
         document.body.append(panel);
 
         Object.assign(state, {
@@ -1337,9 +1425,6 @@
             thinkingSelect,
             fastCheckbox,
             forceChatCheckbox,
-            applyButton,
-            reloadButton,
-            restoreButton,
             hookStatus,
             catalogStatus,
             selectedStatus,
@@ -1355,16 +1440,6 @@
         thinkingSelect.addEventListener('change', () => setSelectedThinkingEffort(thinkingSelect.value, true));
         fastCheckbox.addEventListener('change', () => setFastModeEnabled(fastCheckbox.checked, true));
         forceChatCheckbox.addEventListener('change', () => setForceChatEnabled(forceChatCheckbox.checked, true));
-        applyButton.addEventListener('click', () => {
-            setSelectedModel(input.value, true);
-            renderModels();
-            restoreHook();
-        });
-        reloadButton.addEventListener('click', () => {
-            restoreHook();
-            loadModels();
-        });
-        restoreButton.addEventListener('click', restoreHook);
         collapseButton.addEventListener('click', () => setPanelCollapsed(!state.collapsed, true));
         header.addEventListener('pointerdown', handleHeaderPointerDown);
         header.addEventListener('pointermove', handleHeaderPointerMove);
@@ -1378,11 +1453,22 @@
         setSelectedThinkingEffort(state.selectedThinkingEffort, false);
         setFastModeEnabled(state.fastModeEnabled, false);
         setForceChatEnabled(state.forceChatEnabled, false);
+
+        restorePanelSize();
         setPanelCollapsed(localStorage.getItem(config.collapsedStorageKey) === 'true', false);
         restorePanelPosition();
-    }
 
-    /** Добавляет стили панели выбора модели и параметров генерации. */
+        if (typeof ResizeObserver === 'function') {
+            state.resizeObserver = new ResizeObserver(handlePanelResize);
+            state.resizeObserver.observe(panel);
+        }
+    }
+    /**
+     * Добавляет компактный оконный стиль панели с изменяемым размером.
+     *
+     * Палитра и структура шапки повторяют подход DropMe: отдельная title bar,
+     * иконка приложения, название, вторичная строка версии и плоская кнопка справа.
+     */
     function addStyles() {
         const style = document.createElement('style');
 
@@ -1390,66 +1476,80 @@
         style.textContent = `
             #gpt-model-picker-panel {
                 position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
-                display: flex; width: min(520px, calc(100vw - 32px));
-                max-height: calc(100vh - 32px); overflow: auto; box-sizing: border-box;
-                flex-direction: column; gap: 8px; padding: 12px; color: #f5f5f5;
-                background: #202123; border: 1px solid #565869; border-radius: 12px;
-                box-shadow: 0 8px 30px rgb(0 0 0 / 35%); font: 13px/1.35 Arial, sans-serif;
+                display: flex; width: min(330px, calc(100vw - 16px)); height: min(430px, calc(100vh - 16px));
+                min-width: 260px; min-height: 220px; max-width: calc(100vw - 8px); max-height: calc(100vh - 8px);
+                box-sizing: border-box; flex-direction: column; overflow: hidden; resize: both;
+                color: #f2f5f8; background: #111418; border: 1px solid #34404b; border-radius: 10px;
+                box-shadow: 0 10px 32px rgb(0 0 0 / 38%); font: 11px/1.3 Arial, sans-serif;
             }
             #gpt-model-picker-panel.is-collapsed {
-                width: min(300px, calc(100vw - 16px)); max-height: none; gap: 0; padding: 0;
-                overflow: visible; background: transparent; border: 0; box-shadow: none;
+                height: 44px !important; min-height: 0; max-height: 44px; resize: none;
             }
-            #gpt-model-picker-panel.is-collapsed > :not(.gpt-model-picker-header) { display: none; }
+            #gpt-model-picker-panel.is-collapsed .gpt-model-picker-content { display: none; }
             .gpt-model-picker-header {
-                display: flex; min-height: 38px; align-items: center; justify-content: space-between;
-                gap: 12px; padding: 0 6px 0 10px; touch-action: none; user-select: none;
-                background: rgb(52 53 65 / 96%); border: 1px solid #565869; border-radius: 8px;
-                cursor: grab;
+                display: flex; min-height: 44px; flex: 0 0 44px; align-items: center; justify-content: space-between;
+                gap: 8px; box-sizing: border-box; padding: 6px 7px 6px 8px; touch-action: none; user-select: none;
+                background: #252d36; border-bottom: 1px solid #34404b; cursor: grab;
             }
-            #gpt-model-picker-panel.is-collapsed .gpt-model-picker-header {
-                background: rgb(32 33 35 / 62%); border-color: rgb(86 88 105 / 62%);
-                box-shadow: 0 6px 20px rgb(0 0 0 / 24%); backdrop-filter: blur(6px);
-            }
+            #gpt-model-picker-panel.is-collapsed .gpt-model-picker-header { border-bottom: 0; }
             .gpt-model-picker-header.is-dragging { cursor: grabbing; }
-            .gpt-model-picker-title { font-weight: 700; }
+            .gpt-model-picker-identity {
+                display: flex; min-width: 0; flex: 1 1 auto; align-items: center; gap: 8px; pointer-events: none;
+            }
+            .gpt-model-picker-app-icon { width: 30px; height: 30px; flex: 0 0 30px; }
+            .gpt-model-picker-app-icon svg { display: block; width: 100%; height: 100%; }
+            .gpt-model-picker-title-copy { min-width: 0; }
+            .gpt-model-picker-title {
+                overflow: hidden; color: #f2f5f8; font-size: 12px; font-weight: 700; line-height: 1.15;
+                text-overflow: ellipsis; white-space: nowrap;
+            }
+            .gpt-model-picker-version {
+                margin-top: 2px; overflow: hidden; color: #aeb2b6; font-size: 9px; line-height: 1.1;
+                text-overflow: ellipsis; white-space: nowrap;
+            }
             .gpt-model-picker-collapse {
-                display: grid; width: 28px; height: 28px; flex: 0 0 28px; place-items: center;
-                padding: 0; color: #f5f5f5; background: rgb(23 24 26 / 72%);
-                border: 1px solid rgb(86 88 105 / 72%); border-radius: 6px;
-                font: 700 18px/1 Arial, sans-serif; cursor: pointer;
+                display: grid; width: 26px; height: 26px; flex: 0 0 26px; place-items: center; padding: 0;
+                color: #dce2e8; background: transparent; border: 1px solid transparent; border-radius: 6px;
+                font: 700 16px/1 Arial, sans-serif; cursor: pointer;
             }
-            .gpt-model-picker-collapse:hover { background: rgb(68 70 84 / 90%); }
-            .gpt-model-picker-field { display: grid; gap: 4px; }
-            .gpt-model-picker-field-label { color: #d4d4d8; font-size: 11px; }
+            .gpt-model-picker-collapse:hover { background: #283f4d; border-color: #34404b; }
+            .gpt-model-picker-content {
+                display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; gap: 5px;
+                box-sizing: border-box; padding: 7px; overflow: hidden;
+            }
+            .gpt-model-picker-field { display: grid; flex: 0 0 auto; gap: 2px; min-width: 0; }
+            .gpt-model-picker-field-label { color: #aeb2b6; font-size: 9px; }
             .gpt-model-picker-select, .gpt-model-picker-input {
-                width: 100%; min-height: 34px; box-sizing: border-box; padding: 6px 8px;
-                color: #f5f5f5; background: #343541; border: 1px solid #565869;
-                border-radius: 7px; font: inherit;
+                width: 100%; min-height: 28px; box-sizing: border-box; padding: 4px 6px;
+                color: #f2f5f8; background: #222732; border: 1px solid #34404b;
+                border-radius: 6px; font: 10.5px/1.2 Arial, sans-serif;
             }
-            .gpt-model-picker-fast {
-                display: flex; min-height: 32px; align-items: center; gap: 8px; padding: 0 4px;
-                color: #f5f5f5; cursor: pointer; user-select: none;
+            .gpt-model-picker-toggles {
+                display: grid; flex: 0 0 auto; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px;
             }
-            .gpt-model-picker-checkbox { width: 16px; height: 16px; margin: 0; accent-color: auto; }
-            .gpt-model-picker-buttons { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
-            .gpt-model-picker-button {
-                min-height: 34px; padding: 6px 10px; box-sizing: border-box; color: #f5f5f5;
-                background: #343541; border: 1px solid #565869; border-radius: 7px; font: inherit; cursor: pointer;
+            .gpt-model-picker-toggle {
+                display: flex; min-width: 0; min-height: 27px; align-items: center; gap: 6px; box-sizing: border-box;
+                padding: 3px 5px; color: #f2f5f8; background: #1d232a; border: 1px solid #2a323b;
+                border-radius: 6px; cursor: pointer; user-select: none;
             }
-            .gpt-model-picker-button:hover { background: #444654; }
-            .gpt-model-picker-diagnostics { display: grid; gap: 3px; padding: 8px; background: #17181a; border-radius: 7px; }
-            .gpt-model-picker-status { color: #d4d4d8; word-break: break-word; }
-            .gpt-model-picker-status[data-status-type='success'] { color: #86efac; }
-            .gpt-model-picker-status[data-status-type='warning'] { color: #fde047; }
-            .gpt-model-picker-status[data-status-type='error'] { color: #fca5a5; }
-            .gpt-model-picker-hint { color: #a1a1aa; font-size: 11px; }
-            @media (max-width: 640px) { .gpt-model-picker-buttons { grid-template-columns: 1fr; } }
+            .gpt-model-picker-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .gpt-model-picker-checkbox { width: 14px; height: 14px; flex: 0 0 14px; margin: 0; accent-color: #69afed; }
+            .gpt-model-picker-diagnostics {
+                display: grid; min-height: 0; flex: 1 1 auto; align-content: start; gap: 2px; box-sizing: border-box;
+                padding: 6px; overflow: hidden; background: #0b0e11; border: 1px solid #2a323b; border-radius: 6px;
+                font-size: 9.5px; line-height: 1.25;
+            }
+            .gpt-model-picker-status { color: #c7ccd1; word-break: break-word; }
+            .gpt-model-picker-status[data-status-type='success'] { color: #45c97a; }
+            .gpt-model-picker-status[data-status-type='warning'] { color: #e3a12f; }
+            .gpt-model-picker-status[data-status-type='error'] { color: #e16b6b; }
+            .gpt-model-picker-hint {
+                flex: 0 0 auto; color: #8d949c; font-size: 9px; line-height: 1.2;
+            }
         `;
 
         document.head.append(style);
     }
-
     /** Останавливает проверку, возвращает исходный fetch и удаляет панель. */
     function stop() {
         state.stopped = true;
@@ -1458,6 +1558,11 @@
         if (state.hookTimer !== null) {
             window.clearInterval(state.hookTimer);
             state.hookTimer = null;
+        }
+
+        if (state.resizeObserver) {
+            state.resizeObserver.disconnect();
+            state.resizeObserver = null;
         }
 
         const descriptor = Object.getOwnPropertyDescriptor(window, 'fetch');
@@ -1500,6 +1605,7 @@
         setSelectedThinkingEffort,
         setFastModeEnabled,
         setForceChatEnabled,
+        updateConversationBody,
         restoreHook
     };
 

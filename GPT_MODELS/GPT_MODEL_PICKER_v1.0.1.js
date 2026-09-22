@@ -1,4 +1,4 @@
-// GPT_MODEL_PICKER.js
+// GPT_MODEL_PICKER_v1.0.4.js
 (() => {
     'use strict';
 
