@@ -557,6 +557,21 @@
     }
 
     /**
+     * Возвращает компактное отображение service tier для диагностических строк.
+     *
+     * @param {string} serviceTier
+     * @param {boolean} priorityEnabled
+     * @returns {string}
+     */
+    function formatPriorityStatus(serviceTier, priorityEnabled) {
+        if (priorityEnabled || serviceTier === 'priority') {
+            return '1.5x';
+        }
+
+        return serviceTier || 'штатная';
+    }
+
+    /**
      * Отображает параметры, раскрытые backend-событиями ответа.
      *
      * @param {{ requestedModelSlug: string, requestedThinkingEffort: string, requestedServiceTier: string, verifyDirectWorkChat?: boolean }} requestInfo
@@ -567,30 +582,30 @@
             state.lastResolvedModelSlug = responseInfo.modelSlug;
         }
 
-        const details = [];
+        const lines = ['Backend:'];
         let type = 'success';
 
         if (responseInfo.modelSlug) {
             if (requestInfo.requestedModelSlug && responseInfo.modelSlug !== requestInfo.requestedModelSlug) {
-                details.push(`модель ${requestInfo.requestedModelSlug} → ${responseInfo.modelSlug}`);
+                lines.push(`Model: ${requestInfo.requestedModelSlug} → ${responseInfo.modelSlug}`);
                 type = 'warning';
             } else {
-                details.push(`модель ${responseInfo.modelSlug}`);
+                lines.push(`Model: ${responseInfo.modelSlug}`);
             }
         }
 
         if (responseInfo.thinkingEffort) {
-            details.push(`thinking ${responseInfo.thinkingEffort}`);
+            lines.push(`Thinking: ${responseInfo.thinkingEffort}`);
         }
 
         if (responseInfo.serviceTier) {
-            details.push(`speed ${responseInfo.serviceTier}`);
+            lines.push(`Priority: ${formatPriorityStatus(responseInfo.serviceTier, false)}`);
         }
 
         updateBackendStatus(
-            details.length > 0
-                ? `Backend: ${details.join('; ')}`
-                : 'Backend: HTTP 200; модель и параметры потоком не раскрыты',
+            lines.length > 1
+                ? lines.join('\n')
+                : 'Backend:\nHTTP 200\nПараметры потоком не раскрыты',
             type
         );
     }
@@ -603,14 +618,18 @@
      */
     async function observeConversationResponse(response, requestInfo) {
         if (!response.ok) {
-            updateBackendStatus(`Backend: HTTP ${response.status}; модель ${requestInfo.requestedModelSlug || 'штатная'}`, 'error');
+            updateBackendStatus(`Backend:
+HTTP ${response.status}
+Model: ${requestInfo.requestedModelSlug || 'штатная'}`, 'error');
             return;
         }
 
         const responseBody = response.clone().body;
 
         if (!responseBody) {
-            updateBackendStatus(`Backend: HTTP ${response.status}; поток данных отсутствует`, 'success');
+            updateBackendStatus(`Backend:
+HTTP ${response.status}
+Поток данных отсутствует`, 'success');
             return;
         }
 
@@ -662,10 +681,11 @@
                 displayBackendInfo(requestInfo, responseInfo);
                 log('response stream closed after backend data detection', error);
             } else if (error?.name === 'AbortError' || /aborted/i.test(String(error?.message || ''))) {
-                updateBackendStatus('Backend: HTTP 200; поток закрыт ChatGPT, параметры не раскрыты', 'success');
+                updateBackendStatus('Backend:\nHTTP 200\nПоток закрыт ChatGPT, параметры не раскрыты', 'success');
                 log('response stream aborted before backend data detection', error);
             } else {
-                updateBackendStatus(`Backend: ошибка чтения ответа: ${error.message}`, 'error');
+                updateBackendStatus(`Backend:
+Ошибка чтения ответа: ${error.message}`, 'error');
                 log('response inspection failed', error);
             }
         } finally {
@@ -674,7 +694,7 @@
     }
 
     /**
-     * Формирует строку параметров, применённых к исходящему запросу.
+     * Формирует многострочное описание параметров, применённых к исходящему запросу.
      *
      * @param {{ originalModelSlug: string, requestedModelSlug: string, requestedThinkingEffort: string, requestedServiceTier: string, originalConversationOrigin: string, originalConversationMode: string, requestedConversationMode: string }} requestInfo
      * @returns {string}
@@ -686,16 +706,20 @@
                 ? `${requestInfo.originalModelSlug} → ${requestInfo.requestedModelSlug}`
                 : requestInfo.requestedModelSlug;
         const thinkingText = state.selectedThinkingEffort === 'auto'
-            ? `thinking Auto${requestInfo.requestedThinkingEffort ? ` (${requestInfo.requestedThinkingEffort})` : ''}`
-            : `thinking ${requestInfo.requestedThinkingEffort}`;
-        const speedText = state.fastModeEnabled
-            ? 'скорость 1.5x (priority)'
-            : `скорость штатная${requestInfo.requestedServiceTier ? ` (${requestInfo.requestedServiceTier})` : ''}`;
+            ? `Auto${requestInfo.requestedThinkingEffort ? ` (${requestInfo.requestedThinkingEffort})` : ''}`
+            : requestInfo.requestedThinkingEffort || state.selectedThinkingEffort;
+        const priorityText = formatPriorityStatus(requestInfo.requestedServiceTier, state.fastModeEnabled);
         const modeText = requestInfo.requestedConversationMode === 'chat'
-            ? `режим Chat Mode${requestInfo.originalConversationOrigin ? `; origin ${requestInfo.originalConversationOrigin} → Chat` : ''}`
-            : `режим штатный${requestInfo.originalConversationMode ? ` (${requestInfo.originalConversationMode})` : ''}`;
+            ? `Chat Mode${requestInfo.originalConversationOrigin ? `; origin ${requestInfo.originalConversationOrigin} → Chat` : ''}`
+            : `Mode: штатный${requestInfo.originalConversationMode ? ` (${requestInfo.originalConversationMode})` : ''}`;
 
-        return `Запрос: ${modelText}; ${thinkingText}; ${speedText}; ${modeText}`;
+        return [
+            'Запрос:',
+            `Model: ${modelText || 'штатная'}`,
+            `Thinking: ${thinkingText || 'штатное'}`,
+            `Priority: ${priorityText}`,
+            modeText
+        ].join('\n');
     }
 
     /**
@@ -718,7 +742,7 @@
         const requestInfo = requestBody && updateConversationBody(requestBody.body);
 
         if (!requestBody || !requestInfo) {
-            updateRequestStatus('Запрос: JSON payload не прочитан', 'error');
+            updateRequestStatus('Запрос:\nJSON payload не прочитан', 'error');
             return callDownstreamFetch(input, init);
         }
 
@@ -729,7 +753,7 @@
         state.lastRequestedModelSlug = requestInfo.requestedModelSlug;
         state.lastResolvedModelSlug = '';
         updateRequestStatus(formatRequestStatus(requestInfo), 'success');
-        updateBackendStatus('Backend: ожидание ответа…', 'neutral');
+        updateBackendStatus('Backend:\nОжидание ответа…', 'neutral');
         log('conversation request parameters', requestInfo);
 
         const response = rebuilt
@@ -766,7 +790,7 @@
     }
 
     /**
-     * Записывает текст и визуальный тип строки состояния.
+     * Записывает текст, визуальный тип строки состояния и скрывает пустую строку.
      *
      * @param {HTMLElement | null} element
      * @param {string} message
@@ -776,6 +800,7 @@
         if (element) {
             element.textContent = message;
             element.dataset.statusType = type;
+            element.hidden = !message;
         }
     }
 
@@ -811,16 +836,14 @@
         updateHookStatus();
     }
 
-    /** Обновляет состояние защищённого перехватчика window.fetch. */
+    /** Отображает состояние защищённого перехватчика window.fetch только при ошибке. */
     function updateHookStatus() {
         const descriptor = Object.getOwnPropertyDescriptor(window, 'fetch');
         const isActive = descriptor?.get === getGuardedFetch && descriptor?.set === setGuardedFetch;
 
         setStatus(
             state.hookStatus,
-            isActive
-                ? `\u041f\u0435\u0440\u0435\u0445\u0432\u0430\u0442 fetch: \u0437\u0430\u0449\u0438\u0449\u0451\u043d; \u0448\u0442\u0430\u0442\u043d\u044b\u0445 \u0437\u0430\u043c\u0435\u043d ${state.downstreamReplacementCount}`
-                : '\u041f\u0435\u0440\u0435\u0445\u0432\u0430\u0442 fetch: \u0437\u0430\u0449\u0438\u0442\u0430 \u043d\u0435\u0430\u043a\u0442\u0438\u0432\u043d\u0430',
+            isActive ? '' : 'Перехват fetch:\nзащита неактивна',
             isActive ? 'success' : 'error'
         );
     }
@@ -845,24 +868,9 @@
         setStatus(state.backendStatus, message, type);
     }
 
-    /** Обновляет строку выбранных параметров панели. */
+    /** Оставляет выбранные параметры только в полях управления панели. */
     function updateSelectedStatus() {
-        const modelText = state.selectedModelSlug === config.autoModelSlug
-            ? 'Не изменять модель'
-            : state.selectedModelSlug;
-        const thinkingText = state.selectedThinkingEffort === 'auto'
-            ? 'Auto'
-            : state.selectedThinkingEffort;
-        const speedText = state.fastModeEnabled ? '1.5x / priority' : 'штатная';
-        const modeText = state.forceChatEnabled
-            ? state.selectedModelSlug === config.autoModelSlug ? 'Chat Mode / без замены модели' : 'Chat Mode'
-            : 'штатный';
-
-        setStatus(
-            state.selectedStatus,
-            `Выбрано: ${modelText}; thinking ${thinkingText}; скорость ${speedText}; режим ${modeText}`,
-            'success'
-        );
+        setStatus(state.selectedStatus, '', 'success');
     }
 
     /**
@@ -1189,7 +1197,7 @@
      * @param {number} [attempt]
      */
     async function loadModels(attempt = 0) {
-        setStatus(state.catalogStatus, 'Каталоги: загрузка…', 'neutral');
+        setStatus(state.catalogStatus, '', 'neutral');
 
         const [workResult, chatResult] = await Promise.allSettled([
             loadJson(config.workModelsUrl),
@@ -1225,15 +1233,17 @@
             if (attempt < config.catalogRetryCount) {
                 setStatus(
                     state.catalogStatus,
-                    `Каталоги: повтор ${attempt + 1}/${config.catalogRetryCount}…`,
+                    `Каталоги:
+повтор ${attempt + 1}/${config.catalogRetryCount}…`,
                     'warning'
                 );
                 window.setTimeout(() => loadModels(attempt + 1), config.catalogRetryDelayMs);
             } else {
-                setStatus(state.catalogStatus, `Каталоги: ${errors.join('; ')}`, 'error');
+                setStatus(state.catalogStatus, `Каталоги:
+${errors.join('\n')}`, 'error');
             }
         } else {
-            setStatus(state.catalogStatus, `Каталоги: Work ${state.workModels.length}; ChatGPT ${state.chatModels.length}`, 'success');
+            setStatus(state.catalogStatus, '', 'success');
         }
 
         log('model catalogs loaded', {
@@ -1521,11 +1531,11 @@
         });
         const forceChatText = createElement('span', {}, 'Chat Mode');
         const diagnostics = createElement('div', { class: 'gpt-model-picker-diagnostics' });
-        const hookStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' });
-        const catalogStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Каталоги: инициализация…');
-        const selectedStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Выбрано: инициализация…');
-        const requestStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Запрос: ещё не отправлялся');
-        const backendStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Backend: ещё не проверен');
+        const hookStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status', hidden: '' });
+        const catalogStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status', hidden: '' });
+        const selectedStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status', hidden: '' });
+        const requestStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Запрос:\nещё не отправлялся');
+        const backendStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Backend:\nещё не проверен');
         const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Chat Mode удерживает ручной model slug в обычном primary_assistant Chat. Выключите его, если нужен штатный режим выбранной модели.');
 
         icon.innerHTML = '<svg viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="8" fill="#69afed"/><path d="M9 11.5h14M9 16h9M9 20.5h12" fill="none" stroke="#0f1720" stroke-width="2.2" stroke-linecap="round"/><circle cx="23" cy="20.5" r="2.2" fill="#f2f5f8"/></svg>';
@@ -1538,7 +1548,7 @@
         fastLabel.append(fastCheckbox, fastText);
         forceChatLabel.append(forceChatCheckbox, forceChatText);
         toggles.append(fastLabel, forceChatLabel);
-        diagnostics.append(hookStatus, catalogStatus, selectedStatus, requestStatus, backendStatus);
+        diagnostics.append(hookStatus, catalogStatus, requestStatus, backendStatus);
         content.append(modelLabel, inputLabel, thinkingLabel, toggles, diagnostics, hint);
         panel.append(header, content);
         document.body.append(panel);
@@ -1666,7 +1676,7 @@
                 padding: 6px; overflow: hidden; background: #0b0e11; border: 1px solid #2a323b; border-radius: 6px;
                 font-size: 9.5px; line-height: 1.25;
             }
-            .gpt-model-picker-status { color: #c7ccd1; word-break: break-word; }
+            .gpt-model-picker-status { color: #c7ccd1; word-break: break-word; white-space: pre-line; }
             .gpt-model-picker-status[data-status-type='success'] { color: #45c97a; }
             .gpt-model-picker-status[data-status-type='warning'] { color: #e3a12f; }
             .gpt-model-picker-status[data-status-type='error'] { color: #e16b6b; }
