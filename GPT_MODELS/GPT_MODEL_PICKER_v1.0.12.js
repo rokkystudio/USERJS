@@ -1,4 +1,4 @@
-// GPT_MODEL_PICKER.js v1.0.11
+// GPT_MODEL_PICKER.js v1.0.12
 (() => {
     'use strict';
 
@@ -10,7 +10,7 @@
 
     const config = {
         /** Версия файла и панели. */
-        version: '1.0.11',
+        version: '1.0.12',
 
         /** URL backend-метода со списком моделей режима Work. */
         workModelsUrl: '/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true',
@@ -211,6 +211,9 @@
         backendStatus: null,
         hookTimer: null,
         resizeObserver: null,
+        navigationLinkObserver: null,
+        navigationMenuObserver: null,
+        navigationContextMenuHandler: null,
         dragState: null,
         collapsed: false,
         lastRequestedModelSlug: '',
@@ -1618,6 +1621,566 @@ ${errors.join('\n')}`, 'error');
         }
     }
     /**
+     * Возвращает URL разговора из DOM-атрибутов или данных React-компонента строки.
+     *
+     * Ключ боковой панели покрывает обычные чаты. Проектные строки используют
+     * props ближайших React-компонентов и точное совпадение заголовка строки.
+     *
+     * @param {HTMLElement} container Строка разговора или её контейнер.
+     * @returns {string}
+     */
+    function getNavigationHref(container) {
+        const listItem = container.closest('[data-sidebar-chatgpt-conversation-key]')
+            || container.querySelector('[data-sidebar-chatgpt-conversation-key]');
+        const conversationKey = listItem?.getAttribute('data-sidebar-chatgpt-conversation-key') || '';
+        const conversationPrefix = 'chatgpt:conversation:';
+
+        if (conversationKey.startsWith(conversationPrefix)) {
+            const conversationId = conversationKey.slice(conversationPrefix.length);
+
+            if (conversationId) {
+                return `/c/${encodeURIComponent(conversationId)}`;
+            }
+        }
+
+        const directId = container.getAttribute('data-conversation-id')
+            || container.getAttribute('data-chat-id')
+            || container.dataset.conversationId
+            || '';
+        if (directId) {
+            return `/c/${encodeURIComponent(directId)}`;
+        }
+
+        const row = container.matches('[role="button"]')
+            ? container
+            : container.querySelector('[role="button"]');
+        const title = (row?.innerText || container.innerText || '').trim();
+        if (!row || !title) {
+            return '';
+        }
+
+        const visited = new WeakSet();
+        const idKeys = new Set(['id', 'conversationId', 'conversation_id']);
+        const titleKeys = new Set(['title', 'name']);
+        const readMatchingId = (value, depth = 0) => {
+            if (!value || typeof value !== 'object' || depth > 6 || visited.has(value)) {
+                return '';
+            }
+            visited.add(value);
+
+            if (!Array.isArray(value)) {
+                const keys = Object.keys(value);
+                const itemTitle = keys.find(key => titleKeys.has(key) && typeof value[key] === 'string');
+                const itemId = keys.find(key => idKeys.has(key) && typeof value[key] === 'string');
+
+                if (itemTitle && itemId && value[itemTitle].trim() === title) {
+                    return value[itemId];
+                }
+            }
+
+            for (const key of Object.keys(value)) {
+                const found = readMatchingId(value[key], depth + 1);
+                if (found) {
+                    return found;
+                }
+            }
+            return '';
+        };
+
+        let fiber = null;
+        for (let element = row; element && !fiber; element = element.parentElement) {
+            const fiberKey = Object.keys(element).find(key => key.startsWith('__reactFiber$'));
+            if (fiberKey) {
+                fiber = element[fiberKey];
+            }
+        }
+
+        for (let level = 0; fiber && level < 12; level += 1, fiber = fiber.return) {
+            const props = fiber.memoizedProps || fiber.pendingProps;
+            const conversationId = readMatchingId(props);
+
+            if (conversationId) {
+                return `/c/${encodeURIComponent(conversationId)}`;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Создаёт прозрачную ссылку поверх элемента боковой панели.
+     *
+     * Ссылка сохраняет штатное меню браузера по правому клику и передаёт обычный
+     * левый клик исходному элементу ChatGPT.
+     *
+     * @param {HTMLElement} container Элемент боковой панели.
+     * @param {string} href Адрес разговора или страницы нового чата.
+     * @param {string} type Тип ссылки для синхронизации и очистки.
+     * @param {HTMLElement} parent Элемент, в котором размещается ссылка.
+     * @returns {void}
+     */
+    function ensureNavigationLink(container, href, type, parent = container) {
+        let link = Array.from(parent.children).find(
+            child => child instanceof HTMLAnchorElement
+                && child.dataset.gptModelPickerNavigationLink === type
+        );
+
+        if (!link) {
+            link = document.createElement('a');
+            link.dataset.gptModelPickerNavigationLink = type;
+            link.href = href;
+            link.tabIndex = -1;
+            link.setAttribute('aria-hidden', 'true');
+            link.style.position = 'absolute';
+            link.style.zIndex = '1';
+            link.style.display = 'block';
+            link.style.borderRadius = 'inherit';
+            link.style.textDecoration = 'none';
+
+            link.addEventListener('click', event => {
+                if (
+                    event.button !== 0
+                    || event.metaKey
+                    || event.ctrlKey
+                    || event.shiftKey
+                    || event.altKey
+                ) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                container.click();
+            });
+
+            if (getComputedStyle(parent).position === 'static') {
+                parent.dataset.gptModelPickerOriginalPosition = parent.style.position;
+                parent.style.position = 'relative';
+            }
+
+            if (parent === container) {
+                link.style.inset = '0';
+            } else {
+                link.style.left = `${container.offsetLeft}px`;
+                link.style.top = `${container.offsetTop}px`;
+                link.style.width = `${container.offsetWidth}px`;
+                link.style.height = `${container.offsetHeight}px`;
+            }
+
+            parent.append(link);
+        } else {
+            link.href = href;
+        }
+
+        if (parent === container) {
+            link.style.inset = '0';
+            link.style.left = '';
+            link.style.top = '';
+            link.style.width = '';
+            link.style.height = '';
+        } else {
+            link.style.inset = '';
+            link.style.left = `${container.offsetLeft}px`;
+            link.style.top = `${container.offsetTop}px`;
+            link.style.width = `${container.offsetWidth}px`;
+            link.style.height = `${container.offsetHeight}px`;
+        }
+    }
+
+    /**
+     * Синхронизирует состояние строк разговоров боковой панели.
+     *
+     * Меню открываются штатными триггерами ChatGPT. Пункт новой вкладки
+     * добавляется наблюдателем после создания меню.
+     *
+     * @param {ParentNode} root Корень боковой панели.
+     * @returns {void}
+     */
+    function syncNavigationLinks(root = document) {
+        root.querySelectorAll('button[aria-label="Действия чата"]').forEach(trigger => {
+            const row = getChatActionRow(trigger);
+
+            if (row) {
+                row.dataset.gptModelPickerChatRow = 'true';
+            }
+        });
+    }
+
+    /**
+     * Добавляет «Открыть в новой вкладке» первым пунктом штатного меню чата.
+     *
+     * Пункт создаётся для каждой появившейся панели меню. Адрес разговора
+     * вычисляется при нажатии по данным строки, связанной с этим меню.
+     *
+     * @param {HTMLElement} menu Открытое меню ChatGPT.
+     * @param {HTMLElement} row Строка выбранного разговора.
+     * @returns {void}
+     */
+    function prependOpenConversationItem(menu, row) {
+        const template = menu.querySelector('[role="menuitem"]');
+        if (!template) {
+            return;
+        }
+
+        let item = menu.querySelector('[data-gpt-model-picker-open-in-tab]');
+        if (!item) {
+            item = template.cloneNode(false);
+            item.dataset.gptModelPickerOpenInTab = 'true';
+            item.removeAttribute('id');
+            item.setAttribute('role', 'menuitem');
+            item.setAttribute('tabindex', '-1');
+            item.textContent = 'Открыть в новой вкладке';
+        }
+
+        item.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+
+            const href = getNavigationHref(row);
+            if (!href) {
+                log('Не найден адрес разговора для новой вкладки', row);
+                return;
+            }
+
+            window.open(href, '_blank', 'noopener,noreferrer');
+            menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        };
+
+        if (item !== menu.firstChild) {
+            menu.insertBefore(item, menu.firstChild);
+        }
+    }
+
+    /**
+     * Возвращает строку чата, которой принадлежит кнопка штатного меню.
+     *
+     * @param {HTMLButtonElement} trigger Кнопка «Действия чата».
+     * @returns {HTMLElement | null}
+     */
+    function getChatActionRow(trigger) {
+        const directRow = trigger.closest('[role="button"]');
+        if (directRow instanceof HTMLElement) {
+            return directRow;
+        }
+
+        const container = trigger.closest(
+            '[role="listitem"], [data-sidebar-chatgpt-conversation-key], .group.relative.cursor-interaction'
+        );
+        if (!container) {
+            return null;
+        }
+
+        const row = container.matches('[role="button"]')
+            ? container
+            : container.querySelector('[role="button"]');
+
+        return row instanceof HTMLElement ? row : null;
+    }
+
+    /**
+     * Возвращает кнопку действий, расположенную в строке чата.
+     *
+     * @param {Element | null} target Элемент, по которому выполнен правый клик.
+     * @returns {HTMLButtonElement | null}
+     */
+    function getChatActionTrigger(target) {
+        if (!(target instanceof Element)) {
+            return null;
+        }
+
+        const directTrigger = target.closest('button[aria-label="Действия чата"]');
+        if (directTrigger instanceof HTMLButtonElement) {
+            return directTrigger;
+        }
+
+        const row = target.closest('[role="button"]');
+        const rowTrigger = row?.querySelector('button[aria-label="Действия чата"]');
+        if (rowTrigger instanceof HTMLButtonElement) {
+            return rowTrigger;
+        }
+
+        const container = target.closest(
+            '[role="listitem"], [data-sidebar-chatgpt-conversation-key], .group.relative.cursor-interaction'
+        );
+        const containerTrigger = container?.querySelector('button[aria-label="Действия чата"]');
+
+        return containerTrigger instanceof HTMLButtonElement ? containerTrigger : null;
+    }
+
+    /**
+     * Возвращает кнопку действий чата, связанную с открытым меню.
+     *
+     * Связь определяется по ARIA-атрибутам Radix: идентификатор триггера
+     * передаётся в aria-labelledby меню, а идентификатор меню — в
+     * aria-controls или aria-owns кнопки.
+     *
+     * @param {HTMLElement} menu Открытое меню ChatGPT.
+     * @returns {HTMLButtonElement | null}
+     */
+    function getMenuChatActionTrigger(menu) {
+        const labelIds = (menu.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+
+        for (const id of labelIds) {
+            const trigger = document.getElementById(id);
+
+            if (trigger instanceof HTMLButtonElement && trigger.getAttribute('aria-label') === 'Действия чата') {
+                return trigger;
+            }
+        }
+
+        const menuId = menu.id;
+        if (!menuId) {
+            return null;
+        }
+
+        const triggers = Array.from(document.querySelectorAll('button[aria-label="Действия чата"]'));
+        const controlledTrigger = triggers.find(trigger => {
+            const controlledIds = [
+                trigger.getAttribute('aria-controls'),
+                trigger.getAttribute('aria-owns')
+            ].filter(Boolean).flatMap(value => value.split(/\s+/));
+
+            return controlledIds.includes(menuId);
+        });
+        if (controlledTrigger instanceof HTMLButtonElement) {
+            return controlledTrigger;
+        }
+
+        const expandedTriggers = triggers.filter(trigger => trigger.getAttribute('aria-expanded') === 'true');
+
+        return expandedTriggers.length === 1 ? expandedTriggers[0] : null;
+    }
+
+    /**
+     * Возвращает открытые и видимые штатные меню ChatGPT.
+     *
+     * @returns {HTMLElement[]}
+     */
+    function getOpenChatMenus() {
+        return Array.from(document.querySelectorAll('[role="menu"]')).filter(menu => {
+            if (!(menu instanceof HTMLElement) || menu.dataset.gptModelPickerNewChatMenu) {
+                return false;
+            }
+
+            const style = getComputedStyle(menu);
+            return menu.getClientRects().length > 0
+                && style.display !== 'none'
+                && style.visibility !== 'hidden';
+        });
+    }
+
+    /**
+     * Синхронизирует первый пункт всех открытых штатных меню чатов.
+     *
+     * @returns {void}
+     */
+    function syncOpenNavigationMenus() {
+        getOpenChatMenus().forEach(menu => {
+            const trigger = getMenuChatActionTrigger(menu);
+            const row = trigger ? getChatActionRow(trigger) : null;
+
+            if (row) {
+                prependOpenConversationItem(menu, row);
+            }
+        });
+    }
+
+    /**
+     * Проверяет, является ли кнопка основной кнопкой создания нового чата.
+     *
+     * @param {Element | null} target Целевой элемент события.
+     * @returns {HTMLButtonElement | null}
+     */
+    function getNewChatButton(target) {
+        const button = target?.closest('button');
+
+        if (!(button instanceof HTMLButtonElement)) {
+            return null;
+        }
+
+        return button.getAttribute('aria-label') === 'Новый чат'
+            || button.innerText.trim() === 'Новый чат'
+            ? button
+            : null;
+    }
+
+    /**
+     * Возвращает шаблон штатного меню ChatGPT для меню нового чата.
+     *
+     * @returns {{ menu: HTMLElement, item: HTMLElement } | null}
+     */
+    function getChatMenuTemplate() {
+        const item = document.querySelector('[role="menu"] [role="menuitem"]');
+        const menu = item?.closest('[role="menu"]');
+
+        return item instanceof HTMLElement && menu instanceof HTMLElement
+            ? { menu, item }
+            : null;
+    }
+
+    /**
+     * Создаёт однопунктовое меню нового чата из структуры штатного меню ChatGPT.
+     *
+     * @param {MouseEvent} event Событие правого клика.
+     * @returns {void}
+     */
+    function openNewChatContextMenu(event) {
+        document.querySelector('[data-gpt-model-picker-new-chat-menu]')?.remove();
+
+        const template = getChatMenuTemplate();
+        const menu = template?.menu.cloneNode(false) || document.createElement('div');
+        menu.dataset.gptModelPickerNewChatMenu = 'true';
+        menu.removeAttribute('id');
+        menu.setAttribute('role', 'menu');
+        menu.setAttribute('aria-label', 'Меню нового чата');
+        menu.style.position = 'fixed';
+        menu.style.left = `${Math.min(event.clientX, window.innerWidth - 235)}px`;
+        menu.style.top = `${Math.min(event.clientY, window.innerHeight - 56)}px`;
+        menu.style.zIndex = '2147483647';
+        menu.style.display = 'flex';
+        menu.style.minWidth = '220px';
+        menu.style.padding = '4px';
+        menu.style.flexDirection = 'column';
+        menu.style.color = 'var(--app-color-foreground-application-menu, #f9f9f9)';
+        menu.style.background = 'var(--app-color-background-application-menu, #212121)';
+        menu.style.border = '1px solid var(--app-color-border, #444)';
+        menu.style.borderRadius = '12px';
+        menu.style.boxShadow = '0 8px 24px rgb(0 0 0 / 28%)';
+
+        const item = template?.item.cloneNode(false) || document.createElement('div');
+        item.removeAttribute('id');
+        item.setAttribute('role', 'menuitem');
+        item.setAttribute('tabindex', '0');
+        item.textContent = 'Открыть в новой вкладке';
+        item.style.display = 'flex';
+        item.style.minHeight = '36px';
+        item.style.alignItems = 'center';
+        item.style.padding = '0 12px';
+        item.style.borderRadius = '8px';
+        item.style.cursor = 'pointer';
+        item.onclick = () => {
+            window.open('/', '_blank', 'noopener,noreferrer');
+            closeMenu();
+        };
+        menu.append(item);
+        document.body.append(menu);
+        item.focus();
+
+        const closeMenu = closeEvent => {
+            if (closeEvent?.type === 'keydown' && closeEvent.key !== 'Escape') {
+                return;
+            }
+            if (closeEvent?.type === 'click' && menu.contains(closeEvent.target)) {
+                return;
+            }
+
+            menu.remove();
+            document.removeEventListener('click', closeMenu, true);
+            document.removeEventListener('keydown', closeMenu, true);
+        };
+        document.addEventListener('click', closeMenu, true);
+        document.addEventListener('keydown', closeMenu, true);
+    }
+
+    /**
+     * Открывает меню нового чата или штатное меню действий чата по правому клику.
+     *
+     * @param {MouseEvent} event Событие контекстного меню.
+     * @returns {void}
+     */
+    function handleNavigationContextMenu(event) {
+        const target = event.target instanceof Element ? event.target : null;
+        const newChatButton = getNewChatButton(target);
+
+        if (newChatButton) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            openNewChatContextMenu(event);
+            return;
+        }
+
+        const chatActionTrigger = getChatActionTrigger(target);
+        if (!chatActionTrigger) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        chatActionTrigger.click();
+    }
+
+    /**
+     * Наблюдает за созданием и изменением штатных меню ChatGPT.
+     *
+     * @returns {void}
+     */
+    function observeNavigationLinks() {
+        const sidebar = document.querySelector('[data-app-action-sidebar-scroll]')?.closest('nav') || document.body;
+
+        if (state.navigationLinkObserver) {
+            state.navigationLinkObserver.disconnect();
+        }
+        if (state.navigationMenuObserver) {
+            state.navigationMenuObserver.disconnect();
+        }
+        if (state.navigationContextMenuHandler) {
+            document.removeEventListener('contextmenu', state.navigationContextMenuHandler, true);
+        }
+
+        state.navigationContextMenuHandler = handleNavigationContextMenu;
+        document.addEventListener('contextmenu', state.navigationContextMenuHandler, true);
+
+        state.navigationLinkObserver = new MutationObserver(() => syncNavigationLinks(sidebar));
+        state.navigationLinkObserver.observe(sidebar, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: [
+                'aria-label',
+                'data-sidebar-chatgpt-conversation-key',
+                'data-conversation-id',
+                'data-chat-id'
+            ],
+            characterData: true
+        });
+        syncNavigationLinks(sidebar);
+
+        state.navigationMenuObserver = new MutationObserver(syncOpenNavigationMenus);
+        state.navigationMenuObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: [
+                'aria-controls',
+                'aria-expanded',
+                'aria-labelledby',
+                'aria-owns',
+                'data-state',
+                'style'
+            ]
+        });
+        syncOpenNavigationMenus();
+    }
+
+    /**
+     * Удаляет собственное меню нового чата и обработчики боковой панели.
+     *
+     * @returns {void}
+     */
+    function removeNavigationLinks() {
+        document.querySelectorAll('a[data-gpt-model-picker-navigation-link]').forEach(link => link.remove());
+        document.querySelectorAll('[data-gpt-model-picker-new-chat-menu]').forEach(menu => menu.remove());
+        document.querySelectorAll('[data-gpt-model-picker-chat-row]').forEach(row => {
+            delete row.dataset.gptModelPickerChatRow;
+        });
+
+        if (state.navigationContextMenuHandler) {
+            document.removeEventListener('contextmenu', state.navigationContextMenuHandler, true);
+            state.navigationContextMenuHandler = null;
+        }
+    }
+
+    /**
      * Добавляет компактный оконный стиль панели с изменяемым размером.
      *
      * Палитра и структура шапки повторяют подход DropMe: отдельная title bar,
@@ -1711,7 +2274,7 @@ ${errors.join('\n')}`, 'error');
 
         document.head.append(style);
     }
-    /** Останавливает проверку, возвращает исходный fetch и удаляет панель. */
+    /** Останавливает наблюдатели, возвращает исходный fetch и удаляет панель. */
     function stop() {
         state.stopped = true;
         window.removeEventListener('resize', handleWindowResize);
@@ -1725,6 +2288,17 @@ ${errors.join('\n')}`, 'error');
             state.resizeObserver.disconnect();
             state.resizeObserver = null;
         }
+
+        if (state.navigationLinkObserver) {
+            state.navigationLinkObserver.disconnect();
+            state.navigationLinkObserver = null;
+        }
+        if (state.navigationMenuObserver) {
+            state.navigationMenuObserver.disconnect();
+            state.navigationMenuObserver = null;
+        }
+
+        removeNavigationLinks();
 
         const descriptor = Object.getOwnPropertyDescriptor(window, 'fetch');
 
@@ -1743,7 +2317,7 @@ ${errors.join('\n')}`, 'error');
         document.querySelector('#gpt-model-picker-styles')?.remove();
     }
 
-    /** Запускает панель, перехват запросов и контроль window.fetch. */
+    /** Запускает панель, ссылки боковой панели, перехват запросов и контроль window.fetch. */
     function start() {
         if (!(document.body instanceof HTMLElement)) {
             return;
@@ -1751,6 +2325,7 @@ ${errors.join('\n')}`, 'error');
 
         addStyles();
         createPanel();
+        observeNavigationLinks();
         installFetchGuard();
         state.hookTimer = window.setInterval(restoreHook, config.hookCheckIntervalMs);
         loadModels();
