@@ -192,9 +192,27 @@ TPP-каталог при необходимости повторяется с b
 - параметры последнего исходящего запроса в многострочном формате `Model`, `Thinking`, `Priority` и режим разговора;
 - параметры backend-ответа в многострочном формате `Model`, `Thinking` и `Priority`, если backend раскрывает service tier;
 - ошибки защищённого `fetch`;
-- ошибки загрузки каталогов Work и ChatGPT.
+- ошибки загрузки каталогов Work и ChatGPT;
+- снятые блокировки отправки со счётчиками backend-ответа и кнопки;
+- последние ответы о лимитах из `gpt-model-picker.limit-diagnostics.v1`.
 
 Успешное состояние перехватчика и успешная загрузка каталогов не занимают место в диагностике. Выбранные параметры отображаются самими контролами панели.
+
+## Разблокировка отправки при исчерпанном лимите
+
+Версия 1.0.12 снимает клиентский запрет кнопки отправки, который ChatGPT включает при исчерпанном лимите Work, и не даёт этому запрету вернуться. Режим работает всегда; отдельного переключателя в панели нет.
+
+Используются три независимых механизма:
+
+- перехваченные ответы `/backend-api/wham/usage`, `/backend-api/wham/usage/stream`, `/backend-api/conversation/init` и `/backend-api/f/conversation/prepare` приводятся к разрешающему состоянию: `allowed = true`, `limit_reached = false`, `used_percent` закрытого окна обнуляется, `rate_limit_upsell`, `rate_limit_reached_type` и `overage_limit_reached` очищаются, события SSE переписываются целиком, включая JSON, разбитый сервером на несколько строк `data:`. Именно `conversation/init` сообщает запрет отправки через `blocked_features` со значением вида `tpp_send` и парный `banner_info`; такие флаги удаляются, а посторонние баннеры и блокировки сохраняются. Остальные поля ответа не меняются;
+- наблюдатель DOM снимает с кнопки `aria-disabled="true"`, `disabled`, `data-disabled`, `readonly` и класс `pointer-events-none`, удерживает редактор композера редактируемым, а попытки ChatGPT повторно пометить кнопку отключённой перехватываются на уровне `Element.prototype.setAttribute` и свойства `disabled`;
+- если ChatGPT всё же проигнорировал клик по разблокированной кнопке и ход разговора не начался, отправка повторяется через штатную форму композера.
+
+Режим не меняет entitlement аккаунта: окончательное решение остаётся за backend. Чтобы отправить ход при исчерпанном лимите Work, вместе с разблокировкой используйте `Chat Mode` и ручной model slug — тогда перехватчик отправит ход как обычный Chat.
+
+В панели отображается строка `Отправка:` со счётчиками снятых блокировок ответа backend и кнопки. Пока вмешательства не было, строка скрыта.
+
+Последние срабатывания сохраняются в `gpt-model-picker.limit-diagnostics.v1`: время, вид записи (`json-rewritten`, `json-unchanged`, `sse-rewritten`, `sse-unchanged`) и путь. Тела ответов не сохраняются, поэтому токены и иные данные сессии в снимок не попадают. Хранятся только последние 6 записей.
 
 ## Хранилище
 
@@ -204,6 +222,7 @@ TPP-каталог при необходимости повторяется с b
 - `gpt-model-picker.thinking-effort.v1`;
 - `gpt-model-picker.fast-mode.v1`;
 - `gpt-model-picker.force-chat.v1`;
+- `gpt-model-picker.limit-diagnostics.v1`;
 - `gpt-model-picker.position.v1`;
 - `gpt-model-picker.collapsed.v1`;
 - `gpt-model-picker.size.v1`.
@@ -225,6 +244,8 @@ TPP-каталог при необходимости повторяется с b
 - `setSelectedThinkingEffort(thinkingEffort, persist)`;
 - `setFastModeEnabled(enabled, persist)`;
 - `setForceChatEnabled(enabled, persist)`;
+- `neutralizeRateLimits(value)`;
+- `rewriteLimitedResponse(response, path)`;
 - `updateConversationBody(body)`;
 - `restoreHook()`.
 
@@ -259,3 +280,5 @@ TPP-каталог при необходимости повторяется с b
 `node --check GPT_MODEL_PICKER_v1.0.12.js`
 
 Браузерная проверка контекстного меню выполняется после подключения файла версии 1.0.12.
+
+Разблокировка отправки проверена локальными тестами: снятие запрета отправки из реального ответа `conversation/init` (`blocked_features` + `banner_info`) с сохранением посторонних блокировок, нейтрализация реального ответа `/backend-api/wham/usage`, переписывание JSON-ответов и SSE-событий (включая JSON, разбитый на несколько строк `data:`), отсутствие ложных срабатываний на ответах без лимитов, снятие блокировки с кнопки, обход DOM и повторная отправка через форму композера.

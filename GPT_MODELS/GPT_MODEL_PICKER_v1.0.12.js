@@ -54,6 +54,27 @@
         /** Задержка между повторными загрузками каталогов. */
         catalogRetryDelayMs: 1500,
 
+        /** Путь backend-метода расхода лимитов Work и Codex. */
+        usagePath: '/backend-api/wham/usage',
+
+        /** Путь потокового backend-метода расхода лимитов. */
+        usageStreamPath: '/backend-api/wham/usage/stream',
+
+        /** Путь инициализации разговора, раскрывающий лимиты. */
+        conversationInitPath: '/backend-api/conversation/init',
+
+        /** Путь подготовки хода, раскрывающий лимиты. */
+        conversationPreparePath: '/backend-api/f/conversation/prepare',
+
+        /** Ключ диагностического снимка ответов о лимитах в localStorage. */
+        limitDiagnosticsStorageKey: 'gpt-model-picker.limit-diagnostics.v1',
+
+        /** Максимальное число диагностических записей о лимитах. */
+        limitDiagnosticsLimit: 6,
+
+        /** Задержка перед повторной отправкой, если ChatGPT проигнорировал клик по кнопке. */
+        unlockResubmitDelayMs: 400,
+
         /** Включает диагностические сообщения в консоли браузера. */
         debug: true
     };
@@ -182,6 +203,9 @@
         { slug: 'text-moderation-latest', title: 'text-moderation', badge: '[API-only]' },
         { slug: 'text-moderation-stable', title: 'text-moderation-stable', badge: '[API-only]' }
     ];
+    /** Класс кнопки отправки, с которой снята клиентская блокировка. */
+    const UNLOCKED_SEND_CLASS = 'gpt-model-picker-unlocked-send';
+
     const state = {
         baseFetch: window.fetch,
         downstreamFetch: window.fetch,
@@ -218,6 +242,17 @@
         collapsed: false,
         lastRequestedModelSlug: '',
         lastResolvedModelSlug: '',
+        unlockStatus: null,
+        limitDiagnostics: [],
+        unlockObserver: null,
+        unlockSweepTimer: null,
+        unlockClickHandler: null,
+        unlockClearCount: 0,
+        unlockBackendCount: 0,
+        unlockResubmitInFlight: false,
+        lastConversationRequestAt: 0,
+        originalSetAttribute: null,
+        originalButtonDisabledDescriptor: null,
         stopped: false
     };
 
@@ -737,9 +772,17 @@ HTTP ${response.status}
             return state.baseFetch.call(window, input, init);
         }
 
-        if (state.stopped || getRequestPath(input) !== config.conversationPath) {
+        if (state.stopped) {
             return callDownstreamFetch(input, init);
         }
+
+        const requestPath = getRequestPath(input);
+
+        if (requestPath !== config.conversationPath) {
+            return rewriteLimitedResponse(await callDownstreamFetch(input, init), requestPath);
+        }
+
+        state.lastConversationRequestAt = Date.now();
 
         const requestBody = await readRequestBody(input, init);
         const requestInfo = requestBody && updateConversationBody(requestBody.body);
@@ -804,6 +847,647 @@ HTTP ${response.status}
             element.textContent = message;
             element.dataset.statusType = type;
             element.hidden = !message;
+        }
+    }
+
+    /**
+     * Определяет, раскрывает ли ответ backend данные о лимитах Work и Codex.
+     *
+     * @param {string} path
+     * @returns {boolean}
+     */
+    function isRateLimitResponsePath(path) {
+        return path === config.usagePath
+            || path === config.usageStreamPath
+            || path === config.conversationInitPath
+            || path === config.conversationPreparePath;
+    }
+
+    /**
+     * Определяет backend-флаг, которым ChatGPT блокирует отправку хода.
+     *
+     * Исчерпанный лимит Work приходит в conversation/init как blocked_features и
+     * banner_info со значением вида tpp_send. Остальные блокировки и баннеры
+     * сохраняются без изменений.
+     *
+     * @param {any} name
+     * @returns {boolean}
+     */
+    function isSendBlockingFeature(name) {
+        const value = String(name || '').trim().toLowerCase();
+
+        if (!value) {
+            return false;
+        }
+
+        return value.endsWith('_send')
+            || value.startsWith('tpp_')
+            || value.startsWith('codex_');
+    }
+
+    /**
+     * Переводит объекты лимитов в разрешающее состояние.
+     *
+     * Меняются только поля, по которым ChatGPT определяет исчерпание лимита:
+     * allowed, limit_reached, used_percent окна, rate_limit_upsell,
+     * rate_limit_reached_type и overage_limit_reached. Остальные данные ответа
+     * сохраняются без изменений, поэтому каталоги, разговоры и платежные
+     * сведения приходят в приложение ровно такими, какими их вернул backend.
+     *
+     * @param {any} value
+     * @returns {boolean} true, если значение было изменено
+     */
+    function neutralizeRateLimits(value) {
+        if (!value || typeof value !== 'object') {
+            return false;
+        }
+
+        if (Array.isArray(value)) {
+            let arrayChanged = false;
+
+            for (const item of value) {
+                arrayChanged = neutralizeRateLimits(item) || arrayChanged;
+            }
+
+            return arrayChanged;
+        }
+
+        const hasOwn = key => Object.prototype.hasOwnProperty.call(value, key);
+        const windowKeys = ['primary_window', 'secondary_window'];
+        const looksLikeRateLimit = hasOwn('limit_reached')
+            || (hasOwn('allowed') && (hasOwn('primary_window') || hasOwn('secondary_window') || hasOwn('limit_window_seconds')));
+        let changed = false;
+
+        if (looksLikeRateLimit) {
+            if (value.allowed === false) {
+                value.allowed = true;
+                changed = true;
+            }
+
+            if (value.limit_reached === true) {
+                value.limit_reached = false;
+                changed = true;
+            }
+        }
+
+        for (const windowKey of windowKeys) {
+            const window = value[windowKey];
+
+            if (
+                window
+                && typeof window === 'object'
+                && !Array.isArray(window)
+                && typeof window.used_percent === 'number'
+                && window.used_percent >= 100
+            ) {
+                window.used_percent = 0;
+                changed = true;
+            }
+        }
+
+        if (hasOwn('rate_limit_upsell') && value.rate_limit_upsell !== null) {
+            value.rate_limit_upsell = null;
+            changed = true;
+        }
+
+        if (hasOwn('rate_limit_reached_type') && value.rate_limit_reached_type !== null) {
+            value.rate_limit_reached_type = null;
+            changed = true;
+        }
+
+        if (hasOwn('overage_limit_reached') && value.overage_limit_reached === true) {
+            value.overage_limit_reached = false;
+            changed = true;
+        }
+
+        if (Array.isArray(value.blocked_features)) {
+            const allowedFeatures = value.blocked_features.filter(feature => !isSendBlockingFeature(feature?.name));
+
+            if (allowedFeatures.length !== value.blocked_features.length) {
+                value.blocked_features = allowedFeatures;
+                changed = true;
+            }
+        }
+
+        if (value.banner_info && typeof value.banner_info === 'object' && isSendBlockingFeature(value.banner_info.name)) {
+            value.banner_info = null;
+            changed = true;
+        }
+
+        for (const key of Object.keys(value)) {
+            if (windowKeys.includes(key)) {
+                continue;
+            }
+
+            changed = neutralizeRateLimits(value[key]) || changed;
+        }
+
+        return changed;
+    }
+
+    /**
+     * Создаёт заголовки ответа без длины и сжатия, которые нельзя сохранить
+     * после изменения тела ответа.
+     *
+     * @param {Response} response
+     * @returns {Headers}
+     */
+    function buildRewrittenHeaders(response) {
+        const headers = new Headers(response.headers);
+
+        headers.delete('content-length');
+        headers.delete('content-encoding');
+
+        return headers;
+    }
+
+    /**
+     * Разбирает одно событие SSE и при необходимости нейтрализует лимиты.
+     *
+     * Событие берётся целиком: несколько строк data: склеиваются переводом
+     * строки так же, как это делает EventSource. Поэтому JSON восстанавливается
+     * независимо от того, разбит ли он сервером на несколько строк.
+     *
+     * @param {string} block
+     * @returns {string}
+     */
+    function neutralizeRateLimitStreamBlock(block) {
+        const lines = block.split('\n');
+        const dataIndexes = [];
+        const dataParts = [];
+
+        lines.forEach((line, index) => {
+            if (/^data\s*:/.test(line)) {
+                dataIndexes.push(index);
+                dataParts.push(line.slice(line.indexOf(':') + 1).replace(/^ /, ''));
+            }
+        });
+
+        if (dataIndexes.length === 0) {
+            return block;
+        }
+
+        const payloadText = dataParts.join('\n');
+
+        if (!payloadText.trim() || payloadText.trim() === '[DONE]') {
+            return block;
+        }
+
+        let payload;
+
+        try {
+            payload = JSON.parse(payloadText);
+        } catch (error) {
+            log('rate limit stream event is not JSON', error);
+
+            return block;
+        }
+
+        const changed = neutralizeRateLimits(payload);
+
+        recordLimitDiagnostic(changed ? 'sse-rewritten' : 'sse-unchanged');
+
+        if (!changed) {
+            return block;
+        }
+
+        const firstIndex = dataIndexes[0];
+        const firstLine = lines[firstIndex];
+        const replacedLine = `${firstLine.slice(0, firstLine.indexOf(':') + 1)} ${JSON.stringify(payload)}`;
+        const rebuilt = [];
+
+        for (let index = 0; index < lines.length; index += 1) {
+            if (index === firstIndex) {
+                rebuilt.push(replacedLine);
+            } else if (!dataIndexes.includes(index)) {
+                rebuilt.push(lines[index]);
+            }
+        }
+
+        return rebuilt.join('\n');
+    }
+
+    /**
+     * Создаёт поток преобразования, снимающий лимиты с событий SSE.
+     *
+     * @returns {TransformStream | null}
+     */
+    function createRateLimitStream() {
+        if (typeof TransformStream !== 'function') {
+            return null;
+        }
+
+        const decoder = new TextDecoder();
+        const encoder = new TextEncoder();
+        let buffer = '';
+
+        return new TransformStream({
+            transform(chunk, controller) {
+                buffer += decoder.decode(chunk, { stream: true });
+
+                const blocks = buffer.split(/\r?\n\r?\n/);
+                buffer = blocks.pop() || '';
+
+                if (blocks.length === 0) {
+                    return;
+                }
+
+                controller.enqueue(encoder.encode(`${blocks.map(neutralizeRateLimitStreamBlock).join('\n\n')}\n\n`));
+            },
+            flush(controller) {
+                buffer += decoder.decode();
+
+                if (buffer) {
+                    controller.enqueue(encoder.encode(neutralizeRateLimitStreamBlock(buffer)));
+                }
+            }
+        });
+    }
+
+    /**
+     * Возвращает ответ backend без признаков исчерпанного лимита.
+     *
+     * Ответы других путей, ответы без тела и ответы без JSON или SSE
+     * возвращаются без изменений. Тело исходного ответа читается только тогда,
+     * когда ответ действительно подлежит преобразованию.
+     *
+     * @param {Response} response
+     * @param {string} path
+     * @returns {Promise<Response>}
+     */
+    async function rewriteLimitedResponse(response, path) {
+        if (!response || !isRateLimitResponsePath(path)) {
+            return response;
+        }
+
+        if (!response.ok || response.bodyUsed || response.body === null || response.type === 'opaque') {
+            return response;
+        }
+
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+
+        if (!contentType.includes('event-stream') && !contentType.includes('json')) {
+            return response;
+        }
+
+        if (contentType.includes('event-stream')) {
+            const stream = createRateLimitStream();
+
+            if (!stream) {
+                return response;
+            }
+
+            try {
+                return new Response(response.body.pipeThrough(stream), {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: buildRewrittenHeaders(response)
+                });
+            } catch (error) {
+                log('rate limit stream rewrite failed', error);
+
+                return response;
+            }
+        }
+
+        let text;
+
+        try {
+            text = await response.text();
+        } catch (error) {
+            log('rate limit response read failed', error);
+
+            return response;
+        }
+
+        let rewritten = text;
+
+        try {
+            const payload = JSON.parse(text);
+            const changed = neutralizeRateLimits(payload);
+
+            recordLimitDiagnostic(changed ? 'json-rewritten' : 'json-unchanged', path);
+
+            if (changed) {
+                rewritten = JSON.stringify(payload);
+                state.unlockBackendCount += 1;
+                updateUnlockStatus();
+                log('rate limit payload neutralized', path, payload?.rate_limit);
+            }
+        } catch (error) {
+            log('rate limit payload rewrite failed', error);
+        }
+
+        return new Response(rewritten, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: buildRewrittenHeaders(response)
+        });
+    }
+
+    /**
+     * Определяет кнопку отправки сообщения в композере ChatGPT.
+     *
+     * @param {Element | null} element
+     * @returns {boolean}
+     */
+    function isComposerSendButton(element) {
+        if (!(element instanceof HTMLButtonElement)) {
+            return false;
+        }
+
+        if (element.getAttribute('data-testid') === 'send-button') {
+            return true;
+        }
+
+        const label = String(element.getAttribute('aria-label') || '').trim().toLowerCase();
+
+        return label.startsWith('отправить') || label.startsWith('send');
+    }
+
+    /**
+     * Снимает с кнопки отправки признаки заблокированного состояния.
+     *
+     * @param {HTMLButtonElement} button
+     * @returns {boolean}
+     */
+    function unlockComposerSendButton(button) {
+        let cleared = false;
+
+        if (button.getAttribute('aria-disabled') === 'true') {
+            button.setAttribute('aria-disabled', 'false');
+            cleared = true;
+        }
+
+        if (button.hasAttribute('disabled')) {
+            button.removeAttribute('disabled');
+            cleared = true;
+        }
+
+        if (button.hasAttribute('data-disabled')) {
+            button.removeAttribute('data-disabled');
+            cleared = true;
+        }
+
+        if (button.hasAttribute('readonly')) {
+            button.removeAttribute('readonly');
+            cleared = true;
+        }
+
+        if (button.classList.contains('pointer-events-none')) {
+            button.classList.remove('pointer-events-none');
+            cleared = true;
+        }
+
+        button.classList.add(UNLOCKED_SEND_CLASS);
+
+        if (cleared) {
+            button.dataset.gptModelPickerUnlocked = 'true';
+            state.unlockClearCount += 1;
+            updateUnlockStatus();
+            log('send button unlocked');
+        } else if (button.dataset.gptModelPickerUnlocked) {
+            delete button.dataset.gptModelPickerUnlocked;
+        }
+
+        return cleared;
+    }
+
+    /**
+     * Снимает блокировку с кнопки отправки и редактора композера.
+     *
+     * @returns {void}
+     */
+    function sweepComposerUnlock() {
+        if (state.stopped) {
+            return;
+        }
+
+        document.querySelectorAll('button[aria-label], button[data-testid]').forEach(button => {
+            if (isComposerSendButton(button)) {
+                unlockComposerSendButton(button);
+            }
+        });
+
+        document.querySelectorAll('form [contenteditable="false"], form [readonly]').forEach(node => {
+            if (node instanceof HTMLElement && node.classList.contains('ProseMirror')) {
+                node.setAttribute('contenteditable', 'true');
+                node.removeAttribute('readonly');
+            }
+        });
+    }
+
+    /** Планирует снятие блокировки после изменения DOM ChatGPT. */
+    function scheduleComposerUnlock() {
+        if (state.unlockSweepTimer !== null) {
+            return;
+        }
+
+        state.unlockSweepTimer = window.setTimeout(() => {
+            state.unlockSweepTimer = null;
+            sweepComposerUnlock();
+        }, 0);
+    }
+
+    /**
+     * Повторяет отправку через штатную форму, если ChatGPT проигнорировал клик.
+     *
+     * @param {HTMLButtonElement} button
+     * @returns {void}
+     */
+    function resubmitUnlockedSend(button) {
+        if (state.unlockResubmitInFlight) {
+            return;
+        }
+
+        const form = button.closest('form');
+
+        if (!(form instanceof HTMLFormElement)) {
+            return;
+        }
+
+        state.unlockResubmitInFlight = true;
+        log('ChatGPT ignored the unlocked send button, resubmitting the composer form');
+
+        try {
+            if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit(button);
+            } else {
+                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            }
+        } catch (error) {
+            log('composer form resubmit failed', error);
+        } finally {
+            window.setTimeout(() => {
+                state.unlockResubmitInFlight = false;
+            }, 2000);
+        }
+    }
+
+    /**
+     * Ставит повторную отправку, если клик по разблокированной кнопке не привёл
+     * к созданию хода разговора.
+     *
+     * @param {MouseEvent} event
+     * @returns {void}
+     */
+    function handleUnlockedSendClick(event) {
+        const button = event.target instanceof Element ? event.target.closest('button') : null;
+
+        if (!isComposerSendButton(button) || button.dataset.gptModelPickerUnlocked !== 'true') {
+            return;
+        }
+
+        const clickedAt = Date.now();
+
+        window.setTimeout(() => {
+            if (state.lastConversationRequestAt >= clickedAt) {
+                return;
+            }
+
+            resubmitUnlockedSend(button);
+        }, config.unlockResubmitDelayMs);
+    }
+
+    /**
+     * Ставит защиту от повторной блокировки кнопки отправки.
+     *
+     * Перехватываются только попытки ChatGPT пометить кнопку отправки как
+     * отключённую: свойство disabled и атрибут aria-disabled. Остальные вызовы
+     * setAttribute выполняются штатно.
+     *
+     * @returns {void}
+     */
+    function installSendUnlockGuard() {
+        if (state.unlockObserver) {
+            return;
+        }
+
+        if (typeof state.originalSetAttribute !== 'function') {
+            state.originalSetAttribute = Element.prototype.setAttribute;
+        }
+
+        const originalSetAttribute = state.originalSetAttribute;
+
+        Element.prototype.setAttribute = function setAttribute(name, value) {
+            if (
+                typeof name === 'string'
+                && name.toLowerCase() === 'aria-disabled'
+                && String(value) === 'true'
+                && isComposerSendButton(this)
+            ) {
+                return originalSetAttribute.call(this, name, 'false');
+            }
+
+            return originalSetAttribute.call(this, name, value);
+        };
+
+        const disabledDescriptor = Object.getOwnPropertyDescriptor(HTMLButtonElement.prototype, 'disabled');
+
+        if (disabledDescriptor?.set && !state.originalButtonDisabledDescriptor) {
+            state.originalButtonDisabledDescriptor = disabledDescriptor;
+
+            Object.defineProperty(HTMLButtonElement.prototype, 'disabled', {
+                configurable: true,
+                enumerable: disabledDescriptor.enumerable,
+                get: disabledDescriptor.get,
+                set(value) {
+                    if (value && isComposerSendButton(this)) {
+                        return;
+                    }
+
+                    disabledDescriptor.set.call(this, value);
+                }
+            });
+        }
+
+        state.unlockClickHandler = handleUnlockedSendClick;
+        document.addEventListener('click', state.unlockClickHandler, true);
+
+        state.unlockObserver = new MutationObserver(scheduleComposerUnlock);
+        state.unlockObserver.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['aria-disabled', 'disabled', 'data-disabled', 'contenteditable', 'readonly']
+        });
+
+        sweepComposerUnlock();
+    }
+
+    /** Возвращает штатное поведение кнопки отправки и редактора композера. */
+    function removeSendUnlockGuard() {
+        if (state.unlockObserver) {
+            state.unlockObserver.disconnect();
+            state.unlockObserver = null;
+        }
+
+        if (state.unlockClickHandler) {
+            document.removeEventListener('click', state.unlockClickHandler, true);
+            state.unlockClickHandler = null;
+        }
+
+        if (state.unlockSweepTimer !== null) {
+            window.clearTimeout(state.unlockSweepTimer);
+            state.unlockSweepTimer = null;
+        }
+
+        if (typeof state.originalSetAttribute === 'function') {
+            Element.prototype.setAttribute = state.originalSetAttribute;
+            state.originalSetAttribute = null;
+        }
+
+        if (state.originalButtonDisabledDescriptor) {
+            Object.defineProperty(HTMLButtonElement.prototype, 'disabled', state.originalButtonDisabledDescriptor);
+            state.originalButtonDisabledDescriptor = null;
+        }
+
+        document.querySelectorAll(`.${UNLOCKED_SEND_CLASS}`).forEach(button => {
+            button.classList.remove(UNLOCKED_SEND_CLASS);
+            delete button.dataset.gptModelPickerUnlocked;
+        });
+    }
+
+    /** Показывает снятые блокировки отправки только после реального вмешательства. */
+    function updateUnlockStatus() {
+        const lines = [];
+
+        if (state.unlockBackendCount > 0) {
+            lines.push(`Отправка: лимит снят в ответе backend (${state.unlockBackendCount})`);
+        }
+
+        if (state.unlockClearCount > 0) {
+            lines.push(`Отправка: кнопка разблокирована (${state.unlockClearCount})`);
+        }
+
+        setStatus(state.unlockStatus, lines.join('\n'), 'warning');
+    }
+
+    /**
+     * Сохраняет последние срабатывания нейтрализации лимитов.
+     *
+     * Тела ответов не сохраняются: записываются только время, вид записи и путь.
+     * Хранятся последние записи, чтобы состояние можно было проверить позже.
+     *
+     * @param {string} kind
+     * @param {string} [path]
+     * @returns {void}
+     */
+    function recordLimitDiagnostic(kind, path = '') {
+        try {
+            state.limitDiagnostics.push({
+                at: new Date().toISOString(),
+                kind,
+                path
+            });
+
+            if (state.limitDiagnostics.length > config.limitDiagnosticsLimit) {
+                state.limitDiagnostics = state.limitDiagnostics.slice(-config.limitDiagnosticsLimit);
+            }
+
+            localStorage.setItem(config.limitDiagnosticsStorageKey, JSON.stringify(state.limitDiagnostics));
+        } catch (error) {
+            log('limit diagnostics failed', error);
         }
     }
 
@@ -1552,11 +2236,12 @@ ${errors.join('\n')}`, 'error');
         const forceChatText = createElement('span', {}, 'Chat Mode');
         const diagnostics = createElement('div', { class: 'gpt-model-picker-diagnostics' });
         const hookStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status', hidden: '' });
+        const unlockStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status', hidden: '' });
         const catalogStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status', hidden: '' });
         const selectedStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status', hidden: '' });
         const requestStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Запрос:\nещё не отправлялся');
         const backendStatus = createElement('div', { class: 'gpt-model-picker-status', role: 'status' }, 'Backend:\nещё не проверен');
-        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Chat Mode удерживает ручной model slug в обычном primary_assistant Chat. Выключите его, если нужен штатный режим выбранной модели.');
+        const hint = createElement('div', { class: 'gpt-model-picker-hint' }, 'Chat Mode удерживает ручной model slug в обычном primary_assistant Chat. Выключите его, если нужен штатный режим выбранной модели.\nРазблокировка отправки снимает клиентский запрет кнопки при исчерпанном лимите Work.');
 
         icon.innerHTML = '<svg viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="8" fill="#69afed"/><path d="M9 11.5h14M9 16h9M9 20.5h12" fill="none" stroke="#0f1720" stroke-width="2.2" stroke-linecap="round"/><circle cx="23" cy="20.5" r="2.2" fill="#f2f5f8"/></svg>';
         titleCopy.append(title, version);
@@ -1568,7 +2253,7 @@ ${errors.join('\n')}`, 'error');
         fastLabel.append(fastCheckbox, fastText);
         forceChatLabel.append(forceChatCheckbox, forceChatText);
         toggles.append(fastLabel, forceChatLabel);
-        diagnostics.append(hookStatus, catalogStatus, requestStatus, backendStatus);
+        diagnostics.append(hookStatus, catalogStatus, requestStatus, backendStatus, unlockStatus);
         content.append(modelLabel, inputLabel, thinkingLabel, toggles, diagnostics, hint);
         panel.append(header, content);
         document.body.append(panel);
@@ -1582,6 +2267,7 @@ ${errors.join('\n')}`, 'error');
             thinkingSelect,
             fastCheckbox,
             forceChatCheckbox,
+            unlockStatus,
             hookStatus,
             catalogStatus,
             selectedStatus,
@@ -2245,6 +2931,9 @@ ${errors.join('\n')}`, 'error');
             .gpt-model-picker-toggles {
                 display: grid; flex: 0 0 auto; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px;
             }
+            .gpt-model-picker-unlocked-send {
+                pointer-events: auto !important; cursor: pointer !important; opacity: 1 !important;
+            }
             .gpt-model-picker-toggle {
                 display: flex; min-width: 0; min-height: 27px; align-items: center; gap: 6px; box-sizing: border-box;
                 padding: 3px 5px; color: #f2f5f8; background: #1d232a; border: 1px solid #2a323b;
@@ -2299,6 +2988,7 @@ ${errors.join('\n')}`, 'error');
         }
 
         removeNavigationLinks();
+        removeSendUnlockGuard();
 
         const descriptor = Object.getOwnPropertyDescriptor(window, 'fetch');
 
@@ -2323,11 +3013,16 @@ ${errors.join('\n')}`, 'error');
             return;
         }
 
+        localStorage.removeItem('gpt-model-picker.unlock-send.v1');
         addStyles();
         createPanel();
         observeNavigationLinks();
         installFetchGuard();
-        state.hookTimer = window.setInterval(restoreHook, config.hookCheckIntervalMs);
+        installSendUnlockGuard();
+        state.hookTimer = window.setInterval(() => {
+            restoreHook();
+            sweepComposerUnlock();
+        }, config.hookCheckIntervalMs);
         loadModels();
     }
 
@@ -2341,6 +3036,8 @@ ${errors.join('\n')}`, 'error');
         setSelectedThinkingEffort,
         setFastModeEnabled,
         setForceChatEnabled,
+        neutralizeRateLimits,
+        rewriteLimitedResponse,
         updateConversationBody,
         restoreHook,
         historicalModels,
